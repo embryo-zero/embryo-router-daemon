@@ -1,0 +1,1041 @@
+#!/usr/bin/env python
+# SPDX-License-Identifier: ISC
+
+#
+# test_static_srv6_sids.py
+#
+# Copyright (c) 2025 by
+# Alibaba Inc, Yuqing Zhao <galadriel.zyq@alibaba-inc.com>
+#              Lingyu Zhang <hanyu.zly@alibaba-inc.com>
+#
+
+"""
+test_static_srv6_sids.py:
+Test for SRv6 static route on zebra
+"""
+
+import os
+import re
+import sys
+import json
+import pytest
+import functools
+
+CWD = os.path.dirname(os.path.realpath(__file__))
+sys.path.append(os.path.join(CWD, "../"))
+
+# pylint: disable=C0413
+from lib import topotest
+from lib.topogen import Topogen, TopoRouter, get_topogen
+from lib.topolog import logger
+from lib.checkping import check_ping
+from lib.common_config import shutdown_bringup_interface_in_kernel
+
+pytestmark = [pytest.mark.staticd]
+
+
+def open_json_file(filename):
+    try:
+        with open(filename, "r") as f:
+            return json.load(f)
+    except IOError:
+        assert False, "Could not read file {}".format(filename)
+
+
+def _check_srv6_static_sids(router, expected_route_file, exact=False):
+    logger.info("checking zebra srv6 static sids")
+    output = json.loads(router.vtysh_cmd("show ipv6 route static json"))
+    expected = open_json_file("{}/{}".format(CWD, expected_route_file))
+    return topotest.json_cmp(output, expected, exact=exact)
+
+
+def check_srv6_static_sids(router, expected_file, exact=False):
+    func = functools.partial(_check_srv6_static_sids, router, expected_file, exact)
+    _, result = topotest.run_and_expect(func, None, count=15, wait=1)
+    assert result is None, "Failed"
+
+
+def check_srv6_static_sid_route(router, route, expected_present):
+    def _check():
+        output = json.loads(router.vtysh_cmd("show ipv6 route static json"))
+        route_present = route in output
+        if route_present == expected_present:
+            return None
+        state = "present" if route_present else "absent"
+        expected_state = "present" if expected_present else "absent"
+        return "Static route {} is {}, expected {}".format(route, state, expected_state)
+
+    _, result = topotest.run_and_expect(_check, None, count=15, wait=1)
+    assert result is None, "Failed: {}".format(result)
+
+
+def check_srv6_sid_manager(router, sid, expected_context):
+    def _check():
+        output = json.loads(router.vtysh_cmd("show segment-routing srv6 sid json"))
+        sid_info = output.get(sid)
+
+        if expected_context is None:
+            if sid_info is None:
+                return None
+            return "SID {} is still allocated: {}".format(sid, sid_info)
+
+        if sid_info is None:
+            return "SID {} is not allocated".format(sid)
+
+        actual_context = sid_info.get("context", {})
+        for key, expected_value in expected_context.items():
+            actual_value = actual_context.get(key)
+            if actual_value != expected_value:
+                return "SID {} has context {}, expected {}={}".format(
+                    sid, actual_context, key, expected_value
+                )
+        return None
+
+    _, result = topotest.run_and_expect(_check, None, count=15, wait=1)
+    assert result is None, "Failed: {}".format(result)
+
+
+def _check_srv6_locators(router, expected_names):
+    output = json.loads(router.vtysh_cmd("show segment-routing srv6 locator json"))
+    names = sorted(locator["name"] for locator in output["locators"])
+    return topotest.json_cmp(names, sorted(expected_names), exact=True)
+
+
+def check_srv6_locators(router, expected_names):
+    func = functools.partial(_check_srv6_locators, router, expected_names)
+    _, result = topotest.run_and_expect(func, None, count=15, wait=1)
+    assert result is None, "Failed"
+
+
+def _check_srv6_static_sid_installed(router, sid):
+    output = json.loads(router.vtysh_cmd("show ipv6 route static json"))
+    routes = output.get(sid, [])
+    if any(route.get("installed") for route in routes):
+        return None
+    return "Static SID {} is not installed".format(sid)
+
+
+def check_srv6_static_sid_installed(router, sid):
+    func = functools.partial(_check_srv6_static_sid_installed, router, sid)
+    _, result = topotest.run_and_expect(func, None, count=15, wait=1)
+    assert result is None, result
+
+
+def setup_module(mod):
+    # This topotest sets net.vrf.strict_mode during setup. That sysctl is
+    # available only after the VRF module is loaded; if the module is not loaded,
+    # the strict_mode command may fail and the test can fail later.
+    # Ensure the VRF module is present and loaded before setting strict_mode.
+    if not topotest.module_present("vrf"):
+        pytest.skip("VRF kernel module is not available")
+
+    tgen = Topogen({"s1": ("r1", "r2")}, mod.__name__)
+    tgen.start_topology()
+    for rname, router in tgen.routers().items():
+        router.run("/bin/bash {}/{}/setup.sh".format(CWD, rname))
+        router.load_frr_config()
+    tgen.start_router()
+
+
+def teardown_module():
+    tgen = get_topogen()
+    tgen.stop_topology()
+
+
+def test_srv6_static_sids():
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+    router = tgen.gears["r1"]
+
+    # FOR DEVELOPER:
+    # If you want to stop some specific line and start interactive shell,
+    # please use tgen.mininet_cli() to start it.
+
+    logger.info("Test for srv6 sids configuration")
+    check_srv6_static_sids(router, "expected_srv6_sids.json")
+
+
+def test_srv6_static_sids_locator_prefix_replay():
+    """
+    Enter the same prefix again in the locator and verify that the SIDs
+    allocated from it are not reinstalled (the locator must not flap)
+    """
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+    router = tgen.gears["r1"]
+
+    # staticd has not removed any route yet: a locator flap would make it
+    # remove all its SID routes, and install them again.
+    expected = open_json_file(
+        "{}/{}".format(CWD, "expected_srv6_sids_no_route_delete.json")
+    )
+    result = topotest.router_json_cmp(router, "show zebra client json", expected)
+    assert result is None, "staticd already removed routes"
+
+    router.vtysh_cmd(
+        """
+        configure terminal
+         segment-routing
+          srv6
+           locators
+            locator MAIN
+             prefix fcbb:bbbb:1::/48 block-len 32 node-len 16 func-bits 16
+        """
+    )
+
+    # Add a SID and wait for its route: staticd gets its allocation from
+    # zebra after the locator updates of the replay, if any, so their
+    # effects on the routes of the SIDs have been processed once it is
+    # installed.
+    sid_cmd = """
+        configure terminal
+         segment-routing
+          srv6
+           static-sids
+            {}sid fcbb:bbbb:1:fe90::/64 locator MAIN behavior uDT6 vrf Vrf40
+        """
+    router.vtysh_cmd(sid_cmd.format(""))
+    check_srv6_static_sid_route(router, "fcbb:bbbb:1:fe90::/64", True)
+
+    logger.info("Test that the SID routes are not reinstalled")
+    result = topotest.router_json_cmp(router, "show zebra client json", expected)
+    assert result is None, "staticd removed its SID routes"
+
+    router.vtysh_cmd(sid_cmd.format("no "))
+    check_srv6_static_sid_route(router, "fcbb:bbbb:1:fe90::/64", False)
+    check_srv6_static_sids(router, "expected_srv6_sids.json")
+
+
+def test_srv6_static_sids_sid_delete():
+    """
+    Remove the static SID and verify it gets removed
+    """
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+    router = tgen.gears["r1"]
+
+    router.vtysh_cmd(
+        """
+        configure terminal
+         segment-routing
+          srv6
+           static-sids
+            no sid fcbb:bbbb:1::/48
+        """
+    )
+
+    # FOR DEVELOPER:
+    # If you want to stop some specific line and start interactive shell,
+    # please use tgen.mininet_cli() to start it.
+
+    logger.info("Test for srv6 sids configuration")
+    check_srv6_static_sids(router, "expected_srv6_sids_sid_delete_1.json")
+
+    router.vtysh_cmd(
+        """
+        configure terminal
+         segment-routing
+          srv6
+           static-sids
+            no sid fcbb:bbbb:1:fe20::/64 locator MAIN behavior uDT6 vrf Vrf20
+        """
+    )
+
+    # FOR DEVELOPER:
+    # If you want to stop some specific line and start interactive shell,
+    # please use tgen.mininet_cli() to start it.
+
+    logger.info("Test for srv6 sids configuration")
+    check_srv6_static_sids(router, "expected_srv6_sids_sid_delete_2.json")
+
+
+def test_srv6_static_sids_sid_readd():
+    """
+    Re-add the static SID and verify the routing table
+    """
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+    router = tgen.gears["r1"]
+
+    router.vtysh_cmd(
+        """
+        configure terminal
+         segment-routing
+          srv6
+           static-sids
+            sid fcbb:bbbb:1::/48 locator MAIN behavior uN
+            sid fcbb:bbbb:1:fe20::/64 locator MAIN behavior uDT6 vrf Vrf20
+        """
+    )
+
+    # FOR DEVELOPER:
+    # If you want to stop some specific line and start interactive shell,
+    # please use tgen.mininet_cli() to start it.
+
+    logger.info("Test for srv6 sids configuration")
+    check_srv6_static_sids(router, "expected_srv6_sids.json")
+
+
+def test_srv6_static_sids_sid_modify():
+    """
+    Modify the static SIDs and verify the routing table
+    """
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+    router = tgen.gears["r1"]
+
+    router.vtysh_cmd(
+        """
+        configure terminal
+         segment-routing
+          srv6
+           static-sids
+            sid fcbb:bbbb:1:fe20::/64 locator MAIN behavior uDT46 vrf Vrf40
+        """
+    )
+
+    # FOR DEVELOPER:
+    # If you want to stop some specific line and start interactive shell,
+    # please use tgen.mininet_cli() to start it.
+
+    logger.info("Test for srv6 sids configuration")
+    check_srv6_static_sids(router, "expected_srv6_sids_sid_modify.json")
+
+
+def test_srv6_static_sids_wrong_sid_block():
+    """
+    The purpose of this test is to verify how FRR behaves when the user
+    provides an invalid configuration.
+    Add a new static Sid with a mismatch in locator and sid block
+    to make sure no Sid is allocated by zebra (TBD: Strict verify once show cmd
+    commit is merged (#16836))
+    """
+    router = get_topogen().gears["r1"]
+    router.vtysh_cmd(
+        """
+        configure terminal
+         segment-routing
+          srv6
+           locators
+            locator MAIN1
+             prefix fcbb:1234:1::/48 block-len 32 node-len 16 func-bits 16
+          srv6
+           static-sids
+            sid fcbb:bbbb:1:fe50::/64 locator MAIN1 behavior uA interface sr0 nexthop 2001::3
+        """
+    )
+
+    def wrong_sid_not_installed():
+        output = json.loads(router.vtysh_cmd("show ipv6 route static json"))
+        return "fcbb:bbbb:1:fe50::/64" not in output
+
+    _, result = topotest.run_and_expect(wrong_sid_not_installed, True, count=30, wait=1)
+    assert (
+        result is True
+    ), "Failed. Expected no entry for fcbb:bbbb:1:fe50::/64 since loc and node block dont match"
+
+
+def test_srv6_static_sids_sid_delete_all():
+    """
+    Remove all static SIDs and verify they get removed
+    """
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+    router = tgen.gears["r1"]
+
+    router.vtysh_cmd(
+        """
+        configure terminal
+         segment-routing
+          srv6
+           no static-sids
+        """
+    )
+
+    # FOR DEVELOPER:
+    # If you want to stop some specific line and start interactive shell,
+    # please use tgen.mininet_cli() to start it.
+
+    logger.info("Test for srv6 sids configuration")
+    check_srv6_static_sids(router, "expected_srv6_sids_delete_all.json", exact=True)
+
+
+def test_srv6_static_sids_sid_readd_all():
+    """
+    Re-add the static SIDs and verify the routing table
+    """
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+    router = tgen.gears["r1"]
+
+    router.vtysh_cmd(
+        """
+        configure terminal
+         segment-routing
+          srv6
+           static-sids
+            sid fcbb:bbbb:1::/48 locator MAIN behavior uN
+            sid fcbb:bbbb:1:fe10::/64 locator MAIN behavior uDT4 vrf Vrf10
+            sid fcbb:bbbb:1:fe20::/64 locator MAIN behavior uDT6 vrf Vrf20
+            sid fcbb:bbbb:1:fe30::/64 locator MAIN behavior uDT46 vrf Vrf30
+            sid fcbb:bbbb:1:fe40::/64 locator MAIN behavior uA interface sr0 nexthop 2001::2
+            sid fcbb:bbbb:1:fe60::/64 locator MAIN behavior uDT4 vrf default
+            sid fcbb:bbbb:1:fe70::/64 locator MAIN behavior uDT6 vrf default
+            sid fcbb:bbbb:1:fe80::/64 locator MAIN behavior uDT46 vrf default
+        """
+    )
+
+    # FOR DEVELOPER:
+    # If you want to stop some specific line and start interactive shell,
+    # please use tgen.mininet_cli() to start it.
+
+    logger.info("Test for srv6 sids configuration")
+    check_srv6_static_sids(router, "expected_srv6_sids.json")
+
+
+def test_srv6_static_sids_srv6_disable():
+    """
+    Disable SRv6
+    """
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+    router = tgen.gears["r1"]
+
+    router.vtysh_cmd(
+        """
+        configure terminal
+         segment-routing
+          no srv6
+        """
+    )
+
+    # FOR DEVELOPER:
+    # If you want to stop some specific line and start interactive shell,
+    # please use tgen.mininet_cli() to start it.
+
+    logger.info("Test for srv6 sids configuration")
+    check_srv6_static_sids(router, "expected_srv6_sids_srv6_disable.json", exact=True)
+
+
+def test_srv6_static_sids_srv6_reenable():
+    """
+    Re-enable SRv6
+    """
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+    router = tgen.gears["r1"]
+
+    router.vtysh_cmd(
+        """
+        configure terminal
+         segment-routing
+          srv6
+           locators
+            locator MAIN
+             prefix fcbb:bbbb:1::/48 block-len 32 node-len 16 func-bits 16
+            !
+           !
+           static-sids
+            sid fcbb:bbbb:1::/48 locator MAIN behavior uN
+            sid fcbb:bbbb:1:fe10::/64 locator MAIN behavior uDT4 vrf Vrf10
+            sid fcbb:bbbb:1:fe20::/64 locator MAIN behavior uDT6 vrf Vrf20
+            sid fcbb:bbbb:1:fe30::/64 locator MAIN behavior uDT46 vrf Vrf30
+            sid fcbb:bbbb:1:fe40::/64 locator MAIN behavior uA interface sr0 nexthop 2001::2
+            sid fcbb:bbbb:1:fe60::/64 locator MAIN behavior uDT4 vrf default
+            sid fcbb:bbbb:1:fe70::/64 locator MAIN behavior uDT6 vrf default
+            sid fcbb:bbbb:1:fe80::/64 locator MAIN behavior uDT46 vrf default
+        """
+    )
+
+    # FOR DEVELOPER:
+    # If you want to stop some specific line and start interactive shell,
+    # please use tgen.mininet_cli() to start it.
+
+    logger.info("Test for srv6 sids configuration")
+    check_srv6_static_sids(router, "expected_srv6_sids.json")
+
+
+def test_srv6_static_sids_interface_down_up():
+    """
+    Test SRv6 route behavior when sr0 interface goes down and up
+    """
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+    router = tgen.gears["r1"]
+
+    # First verify initial state
+    logger.info("Verifying initial SRv6 routes")
+    check_srv6_static_sids(router, "expected_srv6_sids.json")
+
+    # Bring down sr0 interface using ip link
+    logger.info("Bringing down sr0 interface using ip link")
+    shutdown_bringup_interface_in_kernel(router.tgen, router.name, "sr0", False)
+
+    # Verify routes using sr0 are removed
+    logger.info("Verifying routes using sr0 are removed")
+    check_srv6_static_sids(router, "expected_srv6_sids_interface_down.json")
+
+    # Bring up sr0 interface using ip link
+    logger.info("Bringing up sr0 interface using ip link")
+    shutdown_bringup_interface_in_kernel(router.tgen, router.name, "sr0", True)
+
+    # Verify routes are restored
+    logger.info("Verifying routes are restored")
+    check_srv6_static_sids(router, "expected_srv6_sids.json")
+
+
+def test_srv6_static_sids_overlapping_locators():
+    """
+    Test SRv6 SID allocation with overlapping locators.
+
+    This test creates a secondary locator with overlapping prefix:
+    - MAIN: fcbb:bbbb:1::/48 (already configured)
+    - LOC2: fcbb:bbbb:1:1::/64 (more specific prefix within MAIN)
+
+    When allocating an explicit SID fcbb:bbbb:1:1:fe00::/80 with locator LOC2,
+    the SID Manager should respect the specified locator and not allocate
+    from MAIN even though MAIN also matches the SID prefix.
+    """
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+    router = tgen.gears["r1"]
+
+    # Add LOC2 locator with overlapping prefix
+    router.vtysh_cmd(
+        """
+        configure terminal
+         segment-routing
+          srv6
+           locators
+            locator LOC2
+             prefix fcbb:bbbb:1:1::/64
+             format usid-f4816
+            !
+           !
+        """
+    )
+
+    # Add a SID that could potentially match both locators, but explicitly specify LOC2
+    # The SID Manager should allocate the SID from LOC2 (the specified locator)
+    # and not from MAIN, even though MAIN also matches the SID prefix
+    router.vtysh_cmd(
+        """
+        configure terminal
+         segment-routing
+          srv6
+           static-sids
+            sid fcbb:bbbb:1:1:fe00::/80 locator LOC2 behavior uDT46 vrf Vrf10
+        """
+    )
+
+    # Verify the SID is correctly allocated from the LOC2 locator
+    logger.info("Test for SRv6 SID allocation with overlapping locators")
+    check_srv6_static_sids(router, "expected_srv6_sids_overlapping_locators.json")
+
+    # Clean up
+    router.vtysh_cmd(
+        """
+        configure terminal
+         segment-routing
+          srv6
+           static-sids
+            no sid fcbb:bbbb:1:1:fe00::/80 locator LOC2 behavior uDT46 vrf Vrf10
+           !
+           locators
+            no locator LOC2
+           !
+        """
+    )
+
+
+def test_srv6_static_sids_ua_basic_resolution():
+    """Test that uA SID resolves neighbor when interface is up and neighbor is present"""
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+    router = tgen.gears["r1"]
+
+    # Configure uA SID without explicit nexthop
+    router.vtysh_cmd(
+        """
+        configure terminal
+         segment-routing
+          srv6
+           static-sids
+            sid fcbb:bbbb:1:fe41::/64 locator MAIN behavior uA interface r1-eth0
+        """
+    )
+
+    # Ensure r2 interface is up and reachable
+    check_ping("r1", "2001::2", True, 10, 1)
+
+    # Verify SID is installed with resolved nexthop
+    logger.info("Test uA SID resolution with available neighbor")
+    check_srv6_static_sids(router, "expected_srv6_sids_and_ua.json")
+
+
+def test_srv6_static_sids_ua_neighbor_down():
+    """Test that uA SID is removed when neighbor becomes unreachable"""
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+    router = tgen.gears["r1"]
+
+    # Start with neighbor up and SID configured (from previous test)
+    check_ping("r1", "2001::2", True, 10, 1)
+    check_srv6_static_sids(router, "expected_srv6_sids_and_ua.json")
+
+    # Bring down r2 interface
+    logger.info("Taking down r2-eth0 interface")
+    shutdown_bringup_interface_in_kernel(
+        tgen.gears['r2'].tgen,
+        tgen.gears['r2'].name,
+        "r2-eth0",
+        False,
+    )
+
+    # Flush neighbor entry on r1 to simulate neighbor unreachable
+    logger.info("Flushing neighbor entry on r1")
+    router.vtysh_cmd("ip neigh flush 2001::2 dev r1-eth0")
+
+    # Ensure neighbor is unreachable
+    check_ping("r1", "2001::2", False, 10, 1)
+
+    # Wait for neighbor to expire and verify SID is removed
+    logger.info("Verify uA SID is removed when neighbor goes down")
+    check_srv6_static_sids(router, "expected_srv6_sids.json")
+
+
+def test_srv6_static_sids_ua_neighbor_recovery():
+    """Test that uA SID is reinstalled when neighbor recovers"""
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+    router = tgen.gears["r1"]
+
+    # Start with neighbor down and SID configured but not installed
+    check_ping("r1", "2001::2", False, 10, 1)
+    check_srv6_static_sids(router, "expected_srv6_sids.json")
+
+    # Bring up r2 interface
+    logger.info("Bringing up r2-eth0 interface")
+    shutdown_bringup_interface_in_kernel(
+        tgen.gears['r2'].tgen,
+        tgen.gears['r2'].name,
+        "r2-eth0",
+        True,
+    )
+
+    # Wait for neighbor discovery and verify SID is installed
+    check_ping("r1", "2001::2", True, 10, 1)
+
+    logger.info("Verify uA SID is installed after neighbor recovery")
+    check_srv6_static_sids(router, "expected_srv6_sids_and_ua.json")
+
+
+def test_srv6_static_sids_ua_sid_removal():
+    """Test cleanup when uA SID with resolution is removed"""
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+    router = tgen.gears["r1"]
+
+    # Remove the SID
+    router.vtysh_cmd(
+        """
+        configure terminal
+         segment-routing
+          srv6
+           static-sids
+            no sid fcbb:bbbb:1:fe41::/64
+        """
+    )
+
+    # Verify SID is removed and neighbor notifications unregistered
+    check_srv6_static_sids(router, "expected_srv6_sids.json")
+
+
+def test_srv6_static_sids_locator_removal_and_readd():
+    """
+    Test locator removal and re-addition workflow with static SIDs.
+
+    This test verifies:
+    1. Removing a locator causes all SIDs to be uninstalled from dataplane (but remain configured)
+    2. Removing specific SIDs from configuration while locator is absent is safe
+    3. Re-adding the locator programs the remaining configured SIDs into dataplane
+    4. Re-adding the previously removed SIDs restores full configuration
+    """
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+    router = tgen.gears["r1"]
+
+    # Step 1: Remove the locator (all SIDs are uninstalled from dataplane but remain configured)
+    logger.info("Removing locator MAIN")
+    router.vtysh_cmd(
+        """
+        configure terminal
+         segment-routing
+          srv6
+           locators
+            no locator MAIN
+        """
+    )
+
+    # Verify all SIDs are uninstalled from dataplane (not present in routing table)
+    logger.info("Verifying all SIDs uninstalled from dataplane after locator removal")
+    check_srv6_static_sids(router, "expected_srv6_sids_delete_all.json")
+
+    # Step 2: Remove two specific SIDs from configuration (other SIDs remain configured)
+    logger.info("Removing two SIDs from configuration")
+    router.vtysh_cmd(
+        """
+        configure terminal
+         segment-routing
+          srv6
+           static-sids
+            no sid fcbb:bbbb:1::/48
+            no sid fcbb:bbbb:1:fe20::/64
+        """
+    )
+
+    # Verify all SIDs still absent from dataplane (locator still removed)
+    logger.info("Verifying all SIDs still absent from dataplane")
+    check_srv6_static_sids(router, "expected_srv6_sids_delete_all.json")
+
+    # Step 3: Re-add the locator (remaining configured SIDs are programmed into dataplane)
+    logger.info("Re-adding locator MAIN")
+    router.vtysh_cmd(
+        """
+        configure terminal
+         segment-routing
+          srv6
+           locators
+            locator MAIN
+             prefix fcbb:bbbb:1::/48 block-len 32 node-len 16 func-bits 16
+        """
+    )
+
+    # Verify configured SIDs are programmed (except the two removed in step 2)
+    logger.info("Verifying remaining configured SIDs programmed into dataplane")
+    check_srv6_static_sids(router, "expected_srv6_sids_sid_delete_2.json")
+
+    # Step 4: Re-add the two previously removed SIDs to restore full configuration
+    logger.info("Re-adding the two previously removed SIDs")
+    router.vtysh_cmd(
+        """
+        configure terminal
+         segment-routing
+          srv6
+           static-sids
+            sid fcbb:bbbb:1::/48 locator MAIN behavior uN
+            sid fcbb:bbbb:1:fe20::/64 locator MAIN behavior uDT6 vrf Vrf20
+        """
+    )
+
+    # Verify all SIDs are configured and programmed into dataplane
+    logger.info("Verifying all SIDs configured and programmed into dataplane")
+    check_srv6_static_sids(router, "expected_srv6_sids.json")
+
+
+SAME_ADDR_SID = "fcbb:bbbb:1::"
+UN_SID_PREFIX = "fcbb:bbbb:1::/48"
+MISSING_LOCATOR_SID_PREFIX = "fcbb:bbbb:1::/64"
+
+EXPECTED_SAME_ADDR_SID_ALLOCATED = {
+    SAME_ADDR_SID: {"locator": "MAIN", "clients": [{"protocol": "static"}]}
+}
+
+EXPECTED_UN_SID_INSTALLED = {
+    UN_SID_PREFIX: [
+        {
+            "installed": True,
+            "nexthops": [
+                {"interfaceName": "sr0", "fib": True, "seg6local": {"action": "uN"}}
+            ],
+        }
+    ],
+    MISSING_LOCATOR_SID_PREFIX: None,
+}
+
+
+def _kernel_sid_route(router, prefix):
+    output = router.run("ip -6 route show {}".format(prefix))
+    # The seg6local encap is on the nexthop object when zebra uses nhid
+    nhid = re.search(r"nhid (\d+)", output)
+    if nhid:
+        output += router.run("ip nexthop show id {}".format(nhid.group(1)))
+    return output
+
+
+def _check_same_address_sids(router, un_sid_present):
+    status = router.check_router_running()
+    if status:
+        return status
+
+    output = json.loads(router.vtysh_cmd("show segment-routing srv6 sid json"))
+    if un_sid_present:
+        expected = EXPECTED_SAME_ADDR_SID_ALLOCATED
+    else:
+        expected = {SAME_ADDR_SID: None}
+    result = topotest.json_cmp(output, expected)
+    if result is not None:
+        return "show segment-routing srv6 sid: {}".format(result)
+
+    output = json.loads(router.vtysh_cmd("show ipv6 route static json"))
+    if un_sid_present:
+        expected = EXPECTED_UN_SID_INSTALLED
+    else:
+        expected = {UN_SID_PREFIX: None, MISSING_LOCATOR_SID_PREFIX: None}
+    result = topotest.json_cmp(output, expected)
+    if result is not None:
+        return "show ipv6 route static: {}".format(result)
+
+    output = _kernel_sid_route(router, UN_SID_PREFIX)
+    if un_sid_present and "seg6local action End" not in output:
+        return "kernel has no seg6local End route for {}: {}".format(
+            UN_SID_PREFIX, output
+        )
+    if not un_sid_present and output.strip():
+        return "kernel still has {}: {}".format(UN_SID_PREFIX, output)
+
+    output = _kernel_sid_route(router, MISSING_LOCATOR_SID_PREFIX)
+    if output.strip():
+        return "kernel has {}: {}".format(MISSING_LOCATOR_SID_PREFIX, output)
+
+    return None
+
+
+def wait_same_address_sids(router, un_sid_present):
+    func = functools.partial(_check_same_address_sids, router, un_sid_present)
+    _, result = topotest.run_and_expect(func, None, count=15, wait=1)
+    return result
+
+
+def staticd_missing_locator_errors(router):
+    log = router.net.getLog("log", "staticd")
+    return [
+        message
+        for message in (
+            "Failed to install SID {}".format(MISSING_LOCATOR_SID_PREFIX),
+            "Failed to release SID {}".format(MISSING_LOCATOR_SID_PREFIX),
+        )
+        if message in log
+    ]
+
+
+def test_srv6_static_sids_same_address_missing_locator():
+    """
+    Configure two SIDs that share an address and differ only in prefix
+    length: a /64 on a locator that does not exist, then the /48 on MAIN.
+    Then remove the /64.
+
+    zebra's SID notification carries the address but not the prefix length.
+    staticd used to mark the /64 as allocated instead of the /48. zebra
+    listed the SID as allocated while the /48 was missing from the RIB and
+    the kernel, staticd logged "Failed to install SID fcbb:bbbb:1::/64", and
+    removing the /64 crashed staticd in static_zebra_release_srv6_sid().
+    """
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+    router = tgen.gears["r1"]
+
+    logger.info("Replace the uN SID with a /64 on missing locator LOC_X")
+    router.vtysh_cmd(
+        """
+        configure terminal
+         segment-routing
+          srv6
+           static-sids
+            no sid fcbb:bbbb:1::/48
+            sid fcbb:bbbb:1::/64 locator LOC_X behavior uN
+        """
+    )
+    result = wait_same_address_sids(router, un_sid_present=False)
+    assert result is None, result
+
+    logger.info("Re-add the uN SID on locator MAIN")
+    router.vtysh_cmd(
+        """
+        configure terminal
+         segment-routing
+          srv6
+           static-sids
+            sid fcbb:bbbb:1::/48 locator MAIN behavior uN
+        """
+    )
+    # Asserted below: removing the /64 is what crashes an unfixed staticd
+    readd_result = wait_same_address_sids(router, un_sid_present=True)
+
+    logger.info("Remove the /64 SID on missing locator LOC_X")
+    router.vtysh_cmd(
+        """
+        configure terminal
+         segment-routing
+          srv6
+           static-sids
+            no sid fcbb:bbbb:1::/64
+        """
+    )
+    removal_result = wait_same_address_sids(router, un_sid_present=True)
+
+    errors = []
+    if readd_result is not None:
+        errors.append("after re-adding the /48: {}".format(readd_result))
+    if removal_result is not None:
+        errors.append("after removing the /64: {}".format(removal_result))
+    for message in staticd_missing_locator_errors(router):
+        errors.append("staticd logged '{}'".format(message))
+    assert not errors, "\n".join(errors)
+
+    logger.info("Verify the other SIDs are unaffected")
+    check_srv6_static_sids(router, "expected_srv6_sids.json")
+
+
+def test_srv6_static_sid_vrf_recreation():
+    """Release and reallocate a static uDT46 SID as its VRF is recreated."""
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+    router = tgen.gears["r1"]
+
+    sid = "fcbb:bbbb:1:fe30::"
+    sid_prefix = "{}/64".format(sid)
+    check_srv6_static_sids(router, "expected_srv6_sids.json")
+    check_srv6_sid_manager(router, sid, {"vrfName": "Vrf30"})
+
+    logger.info("Delete Vrf30")
+    router.run("ip link del Vrf30")
+    check_srv6_sid_manager(router, sid, None)
+    check_srv6_static_sid_route(router, sid_prefix, expected_present=False)
+
+    logger.info("Recreate Vrf30 with the same table ID")
+    router.run("ip link add Vrf30 type vrf table 30")
+    router.run("ip link set Vrf30 up")
+    check_srv6_sid_manager(router, sid, {"vrfName": "Vrf30"})
+    check_srv6_static_sids(router, "expected_srv6_sids.json")
+
+    logger.info("Delete the uDT46 SID")
+    router.vtysh_cmd(
+        """
+        configure terminal
+         segment-routing
+          srv6
+           static-sids
+            no sid fcbb:bbbb:1:fe30::/64 locator MAIN behavior uDT46 vrf Vrf30
+        """
+    )
+    check_srv6_sid_manager(router, sid, None)
+    check_srv6_static_sid_route(router, sid_prefix, expected_present=False)
+
+    logger.info("Reallocate the uDT46 SID")
+    router.vtysh_cmd(
+        """
+        configure terminal
+         segment-routing
+          srv6
+           static-sids
+            sid fcbb:bbbb:1:fe30::/64 locator MAIN behavior uDT46 vrf Vrf30
+        """
+    )
+    check_srv6_sid_manager(router, sid, {"vrfName": "Vrf30"})
+    check_srv6_static_sids(router, "expected_srv6_sids.json")
+
+
+def test_srv6_no_locators():
+    """Remove all configured SRv6 locators with one command."""
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+    router = tgen.gears["r1"]
+
+    check_srv6_static_sids(router, "expected_srv6_sids.json")
+
+    # Add a second locator.
+    router.vtysh_cmd(
+        """
+        configure terminal
+         segment-routing
+          srv6
+           locators
+            locator SECOND
+             prefix fcbb:bbbb:2::/48
+             format usid-f3216
+        """
+    )
+    router.vtysh_cmd(
+        """
+        configure terminal
+         segment-routing
+          srv6
+           static-sids
+            sid fcbb:bbbb:2::/48 locator SECOND behavior uN
+        """
+    )
+
+    check_srv6_locators(router, ["MAIN", "SECOND"])
+    check_srv6_static_sid_installed(router, "fcbb:bbbb:2::/48")
+
+    router.vtysh_cmd(
+        """
+        configure terminal
+         segment-routing
+          srv6
+           no locators
+        """
+    )
+
+    check_srv6_locators(router, [])
+    check_srv6_static_sids(router, "expected_srv6_sids_delete_all.json", exact=True)
+
+
+def test_srv6_static_sids_readd_locator():
+    """Verify static SIDs are allocated after re-adding a locator."""
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+    router = tgen.gears["r1"]
+
+    logger.info("Re-add locator MAIN")
+    router.vtysh_cmd(
+        """
+        configure terminal
+         segment-routing
+          srv6
+           locators
+            locator MAIN
+             prefix fcbb:bbbb:1::/48
+             format usid-f3216
+        """
+    )
+    router.vtysh_cmd(
+        """
+        configure terminal
+         segment-routing
+          srv6
+           locators
+            locator SECOND
+             prefix fcbb:bbbb:2::/48
+             format usid-f3216
+        """
+    )
+
+    check_srv6_static_sids(router, "expected_srv6_sids.json")
+    check_srv6_static_sid_installed(router, "fcbb:bbbb:2::/48")
+
+
+if __name__ == "__main__":
+    args = ["-s"] + sys.argv[1:]
+    sys.exit(pytest.main(args))

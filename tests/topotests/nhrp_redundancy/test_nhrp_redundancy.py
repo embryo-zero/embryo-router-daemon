@@ -1,0 +1,591 @@
+#!/usr/bin/env python
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# test_nhrp_redundancy.py
+#
+# Copyright 2024, LabN Consulting, L.L.C.
+# Dave LeRoy
+#
+
+import os
+import sys
+import json
+from functools import partial
+import pytest
+import re
+import time
+
+# pylint: disable=C0413
+# Import topogen and topotest helpers
+from lib import topotest
+from lib.topogen import Topogen, TopoRouter, get_topogen
+from lib.topolog import logger
+from lib.common_config import (
+    required_linux_kernel_version,
+    shutdown_bringup_interface,
+    retry,
+    shutdown_bringup_interface_in_kernel,
+)
+
+"""
+test_nhrp_redundancy.py: Test NHS redundancy for NHRP
+"""
+
+TOPOLOGY = """
++------------+                  +------------+                   +------------+
+|            |                  |            |                   |            |
+|            |                  |            |                   |            |
+|   NHS 1    |                  |   NHS 2    |                   |    NHS 3   |
+|            |                  |            |                   |            |
++-----+------+                  +-----+------+                   +-----+------+
+      |.1                             |.2                              |.3
+      |                               |                                |
+      |                               |            192.168.1.0/24      |
+------+-------------------------------+------------------+-------------+------
+                                                         |
+                                                         |.6
+         GRE P2MP between all NHS and NHC          +-----+------+
+               172.16.1.x/32                       |            |
+                                                   |            |
+                                                   |   Router   |
+                                                   |            |
+                                                   +-----+------+
+                                                         |
+                                                         |
+                               ---------+----------------+-------------+------
+                                        |          192.168.2.0/24      |
+                                        |                              |
+                       |                |.4                            |.5
++------------+         |        +-------+----+                  +------+-----+     |
+|            |         |        |            |                  |            |     |
+|            |         +--------+            |                  |            |     |
+|    Host    |.7       |        |    NHC 1   |                  |    NHC 2   +-----+10.5.5.0/24
+|            +---------+        |            |                  |            |     |
++------------+         |        +------------+                  +------------+     |
+                       |                                                           |
+                  10.4.4.0/24
+"""
+
+# Save the Current Working Directory to find configuration files.
+CWD = os.path.dirname(os.path.realpath(__file__))
+sys.path.append(os.path.join(CWD, "../"))
+
+# Required to instantiate the topology builder class.
+
+pytestmark = [pytest.mark.nhrpd]
+
+PING_PID = None
+
+
+def build_topo(tgen):
+    "Build function"
+
+    # Create 7 routers
+    for rname in ["nhs1", "nhs2", "nhs3", "nhc1", "nhc2", "router", "host"]:
+        tgen.add_router(rname)
+
+    switch = tgen.add_switch("s1")
+    switch.add_link(tgen.gears["nhs1"])
+    switch.add_link(tgen.gears["nhs2"])
+    switch.add_link(tgen.gears["nhs3"])
+    switch.add_link(tgen.gears["router"])
+
+    switch = tgen.add_switch("s2")
+    switch.add_link(tgen.gears["nhc1"])
+    switch.add_link(tgen.gears["nhc2"])
+    switch.add_link(tgen.gears["router"])
+
+    switch = tgen.add_switch("s3")
+    switch.add_link(tgen.gears["nhc1"])
+    switch.add_link(tgen.gears["host"])
+
+    switch = tgen.add_switch("s4")
+    switch.add_link(tgen.gears["nhc2"])
+
+
+def _apply_nhrp_cmd(tgen, cmd, rname, unit):
+    if isinstance(cmd, tuple):
+        shutdown_bringup_interface_in_kernel(
+            tgen, rname, cmd[1].format(rname, unit), cmd[0] == "up"
+        )
+        return
+    formatted = cmd.format(rname, unit)
+    logger.info("input: " + formatted)
+    output = tgen.net[rname].cmd(formatted)
+    logger.info("output: " + output)
+
+
+def _populate_iface():
+    tgen = get_topogen()
+    cmds_tot_hub = [
+        "ip tunnel add {0}-gre0 mode gre ttl 64 key 42 dev {0}-eth0 local 192.168.1.{1} remote 0.0.0.0",
+        ("up", "{0}-gre0"),
+        "echo 0 > /proc/sys/net/ipv4/ip_forward_use_pmtu",
+        "echo 1 > /proc/sys/net/ipv6/conf/{0}-eth0/disable_ipv6",
+        "echo 1 > /proc/sys/net/ipv6/conf/{0}-gre0/disable_ipv6",
+        "iptables -A FORWARD -i {0}-gre0 -o {0}-gre0 -m hashlimit --hashlimit-upto 4/minute --hashlimit-burst 1 --hashlimit-mode srcip,dstip --hashlimit-srcmask 24 --hashlimit-dstmask 24 --hashlimit-name loglimit-0 -j NFLOG --nflog-group 1 --nflog-size 128",
+    ]
+
+    cmds_tot = [
+        "ip tunnel add {0}-gre0 mode gre ttl 64 key 42 dev {0}-eth0 local 192.168.2.{1} remote 0.0.0.0",
+        ("up", "{0}-gre0"),
+        "echo 0 > /proc/sys/net/ipv4/ip_forward_use_pmtu",
+        "echo 1 > /proc/sys/net/ipv6/conf/{0}-eth0/disable_ipv6",
+        "echo 1 > /proc/sys/net/ipv6/conf/{0}-gre0/disable_ipv6",
+    ]
+
+    for cmd in cmds_tot_hub:
+        for rname, unit in (("nhs1", "1"), ("nhs2", "2"), ("nhs3", "3")):
+            _apply_nhrp_cmd(tgen, cmd, rname, unit)
+
+    for cmd in cmds_tot:
+        for rname, unit in (("nhc1", "4"), ("nhc2", "5")):
+            _apply_nhrp_cmd(tgen, cmd, rname, unit)
+
+
+def _verify_iptables():
+    tgen = get_topogen()
+    # Verify iptables is installed. Required for shortcuts
+    rc, _, _ = tgen.net["nhs1"].cmd_status("iptables -V")
+    return True if rc == 0 else False
+
+
+# Key of the "table" entries of the nhrp json commands
+NHRP_TABLE_KEYS = {
+    "show ip nhrp cache json": "protocol",
+    "show ip nhrp shortcut json": "prefix",
+}
+
+
+def router_nhrp_json_cmp(router, cmd, expected):
+    """
+    Compare the nhrp json output with the "table" list converted to a
+    dictionary, so that a mismatch reports the missing or wrong entry.
+    The entries not expected are reported as well.
+    """
+    output = router.vtysh_cmd(cmd, isjson=True)
+    key = NHRP_TABLE_KEYS[cmd]
+    output["table"] = {entry[key]: entry for entry in output.get("table", [])}
+    result = topotest.json_cmp(output, expected)
+    if result is None:
+        return None
+
+    for name, entry in output["table"].items():
+        if name not in expected.get("table", {}):
+            result.add_error(
+                f"> $->table->{name}: output has unexpected entry: {json.dumps(entry)}"
+            )
+    return result
+
+
+def ping_test(source_router, target_ip, count=1000, description=""):
+    """
+    Test ping connectivity between routers, allowing up to 90% packet loss.
+
+    Args:
+        source_router: The router object to ping from
+        target_ip: The IP address to ping
+        count: Number of ping packets to send (default: 1000)
+        description: Optional description for logging
+
+    Returns:
+        bool: True if ping successful, False otherwise
+    """
+    tgen = get_topogen()
+
+    if description:
+        logger.info(
+            f"Check Ping IPv4 from {source_router.name} to {target_ip} - {description}"
+        )
+    else:
+        logger.info(f"Check Ping IPv4 from {source_router.name} to {target_ip}")
+
+    output = source_router.run(f"ping {target_ip} -f -c {count}")
+
+    # Parse the output for transmitted/received
+    match = re.search(
+        r"(\d+) packets transmitted, (\d+) received(?:, \+\d+ errors)?, ([\d.]+)% packet loss",
+        output,
+    )
+    if not match:
+        assertmsg = (
+            f"Could not parse ping output from {source_router.name} to {target_ip}"
+        )
+        assert 0, assertmsg
+    transmitted = int(match.group(1))
+    received = int(match.group(2))
+    loss_pct = float(match.group(3))
+
+    if loss_pct > 90:
+        assertmsg = f"Ping from {source_router.name} to {target_ip}: {transmitted} sent, {received} received, {loss_pct:.1f}% loss (allowed ≤ 90%)"
+        assert 0, assertmsg
+    else:
+        logger.info(
+            f"Check Ping IPv4 from {source_router.name} to {target_ip} OK: {transmitted} sent, {received} received, {loss_pct:.1f}% loss"
+        )
+        return True
+
+
+def setup_module(mod):
+    logger.info("NHRP Redundant NHS:\n {}".format(TOPOLOGY))
+
+    result = required_linux_kernel_version("4.18")
+    if result is not True:
+        pytest.skip("Kernel requirements are not met")
+
+    tgen = Topogen(build_topo, mod.__name__)
+    tgen.start_topology()
+
+    # Starting Routers
+    router_list = tgen.routers()
+    _populate_iface()
+
+    for rname in ("nhc1", "nhc2"):
+        # set probe timer to 5s (1/3 of the NHRP holdtime of 15s)
+        tgen.gears[rname].cmd(
+            f"""
+sysctl -w net.ipv4.neigh.{rname}-gre0.base_reachable_time_ms=5000
+sysctl -w net.ipv4.neigh.{rname}-gre0.delay_first_probe_time=0
+        """
+        )
+
+    for router in router_list.values():
+        router.load_frr_config()
+
+    # Initialize all routers.
+    tgen.start_router()
+
+
+def teardown_module(_mod):
+    "Teardown the pytest environment"
+    tgen = get_topogen()
+
+    if PING_PID:
+        tgen.gears["host"].cmd(f"kill {PING_PID}")
+
+    tgen.stop_topology()
+
+
+def test_protocols_convergence():
+    """
+    Assert that all protocols have converged before checking for the NHRP
+    statuses as they depend on it.
+    """
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    logger.info("Checking NHRP cache for convergence")
+    router_list = tgen.routers()
+
+    logger.info("Check NHRP cache on servers and clients")
+    for rname, router in router_list.items():
+        if "nh" not in rname:
+            continue
+
+        json_file = "{}/{}/nhrp_cache.json".format(CWD, router.name)
+        expected = json.loads(open(json_file).read())
+        test_func = partial(
+            router_nhrp_json_cmp, router, "show ip nhrp cache json", expected
+        )
+        _, result = topotest.run_and_expect(test_func, None, count=40, wait=0.5)
+
+        assertmsg = '"{}" "show ip nhrp cache" output mismatches'.format(router.name)
+        assert result is None, assertmsg
+
+    # Check NHRP IPV4 routes on servers and clients
+    logger.info("Checking IPv4 routes for convergence")
+    for rname, router in router_list.items():
+        if "nh" not in rname:
+            continue
+
+        json_file = "{}/{}/nhrp_route.json".format(CWD, router.name)
+        expected = json.loads(open(json_file).read())
+        test_func = partial(
+            topotest.router_json_cmp, router, "show ip route nhrp json", expected
+        )
+        _, result = topotest.run_and_expect(test_func, None, count=40, wait=0.5)
+
+        assertmsg = '"{}" "show ip route nhrp" output mismatches'.format(router.name)
+        assert result is None, assertmsg
+
+    # Test connectivity from 1 NHRP server to all clients
+    nhs1 = tgen.gears["nhs1"]
+    ping_test(nhs1, "172.16.1.4", 1000, "nhc1")
+    ping_test(nhs1, "172.16.1.5", 1000, "nhc2")
+
+    # Test connectivity from 1 NHRP client to all servers
+    nhc1 = tgen.gears["nhc1"]
+    ping_test(nhc1, "172.16.1.1", 1000, "nhs1")
+    ping_test(nhc1, "172.16.1.2", 1000, "nhs2")
+    ping_test(nhc1, "172.16.1.3", 1000, "nhs3")
+
+
+def test_local_map_neighbor():
+    """
+    Assert that nhrpd survives a kernel neighbor request for a local map
+    entry, which has no peer.
+    """
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    nhc1 = tgen.gears["nhc1"]
+
+    logger.info("nhc1: map 172.16.1.99 as a local address")
+    nhc1.vtysh_cmd(
+        """
+        configure terminal
+         interface nhc1-gre0
+          ip nhrp map 172.16.1.99 local
+        """
+    )
+    expected = {"table": {"172.16.1.99": {"type": "local"}}}
+    test_func = partial(router_nhrp_json_cmp, nhc1, "show ip nhrp cache json", expected)
+    _, result = topotest.run_and_expect(test_func, None, count=20, wait=1)
+    assert result is None, "nhc1: 172.16.1.99 local entry missing"
+
+    logger.info("nhc1: send traffic to 172.16.1.99 through nhc1-gre0")
+    nhc1.cmd("ip route add 172.16.1.99/32 dev nhc1-gre0")
+
+    def _local_neighbor_probed():
+        nhc1.cmd("ping -c 1 -W 1 172.16.1.99")
+        output = nhc1.cmd("ip -s neigh show 172.16.1.99 dev nhc1-gre0")
+        return re.search(r"probes [1-9]", output) is not None
+
+    # Check that the kernel has sent unawswered probes
+    _, result = topotest.run_and_expect(_local_neighbor_probed, True, count=20, wait=1)
+    assert result is True, "nhc1: no neighbor request for 172.16.1.99"
+    assert nhc1.check_router_running() == "", "nhc1: a daemon died"
+
+    logger.info("nhc1: remove the 172.16.1.99 route and local map")
+    nhc1.cmd("ip route del 172.16.1.99/32 dev nhc1-gre0")
+    nhc1.vtysh_cmd(
+        """
+        configure terminal
+         interface nhc1-gre0
+          no ip nhrp map 172.16.1.99 local
+        """
+    )
+    expected = {"table": {"172.16.1.99": None}}
+    test_func = partial(router_nhrp_json_cmp, nhc1, "show ip nhrp cache json", expected)
+    _, result = topotest.run_and_expect(test_func, None, count=20, wait=1)
+    assert result is None, "nhc1: 172.16.1.99 local entry not removed"
+
+
+@retry(retry_timeout=30, initial_wait=5)
+def verify_shortcut_path():
+    """
+    Verifying that traffic flows through shortcut path
+    """
+    tgen = get_topogen()
+    host = tgen.gears["host"]
+    ping_test(host, "10.5.5.5", 1000, "nhc2")
+
+
+def test_redundancy_shortcut():
+    """
+    Assert that if shortcut created and then NHS goes down, there is no traffic disruption
+    """
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    if not _verify_iptables():
+        pytest.skip("iptables not installed")
+
+    logger.info("Testing NHRP shortcuts with redundant servers")
+
+    logger.info("Verify nhc1 nhrp routes before shortcut creation")
+    nhc1 = tgen.gears["nhc1"]
+    json_file = "{}/{}/nhrp_route.json".format(CWD, nhc1.name)
+    assertmsg = "No nhrp_route file found"
+    assert os.path.isfile(json_file), assertmsg
+
+    expected = json.loads(open(json_file).read())
+    test_func = partial(
+        topotest.router_json_cmp, nhc1, "show ip route nhrp json", expected
+    )
+    _, result = topotest.run_and_expect(test_func, None, count=40, wait=0.5)
+
+    assertmsg = '"{}" "show ip route nhrp" output mismatches'.format(nhc1.name)
+    assert result is None, assertmsg
+
+    logger.info("Initiate shortcut by pinging between clients")
+    host = tgen.gears["host"]
+    ping_test(host, "10.5.5.5", 1000, "nhc2 via shortcut")
+
+    logger.info("Ping in background to maintain the shorcut")
+    global PING_PID
+    PING_PID = host.cmd("ping -W 1 10.5.5.5 >/dev/null 2>&1 & echo $!").strip()
+
+    logger.info("Check that NHRP shortcut route installed")
+    json_file = "{}/{}/nhrp_route_shortcut.json".format(CWD, nhc1.name)
+    assertmsg = "No nhrp_route file found"
+    assert os.path.isfile(json_file), assertmsg
+
+    expected = json.loads(open(json_file).read())
+    test_func = partial(
+        topotest.router_json_cmp, nhc1, "show ip route nhrp json", expected
+    )
+    _, result = topotest.run_and_expect(test_func, None, count=40, wait=0.5)
+
+    assertmsg = '"{}" "show ip route nhrp" output mismatches'.format(nhc1.name)
+    assert result is None, assertmsg
+
+    json_file = "{}/{}/nhrp_shortcut_present.json".format(CWD, nhc1.name)
+    expected = json.loads(open(json_file).read())
+    test_func = partial(
+        router_nhrp_json_cmp, nhc1, "show ip nhrp shortcut json", expected
+    )
+    _, result = topotest.run_and_expect(test_func, None, count=40, wait=0.5)
+
+    assertmsg = '"{}" "show ip nhrp shortcut" output mismatches'.format(nhc1.name)
+    assert result is None, assertmsg
+
+    logger.info("Testing NHRP shortcuts are stable for 30s")
+    end = time.time() + 30
+    while time.time() < end:
+        result = test_func()
+        assertmsg = f"NHRP shortcut output changed during stability check: {result}"
+        assert result is None, assertmsg
+        time.sleep(0.5)
+
+    host.cmd(f"kill {PING_PID}")
+    PING_PID = None
+
+    logger.info("check the shortcut disappears because of no traffic")
+
+    expected = {"attr": {"entriesCount": 0}}
+
+    for rname in ("nhc1", "nhc2"):
+        router = tgen.gears[rname]
+        test_func = partial(
+            router_nhrp_json_cmp, router, "show ip nhrp shortcut json", expected
+        )
+        _, result = topotest.run_and_expect(test_func, None, count=60, wait=1)
+
+        assertmsg = '"{}" "show ip nhrp shortcut" output mismatches'.format(rname)
+        assert result is None, assertmsg
+
+
+def test_redundancy_shortcut_backup():
+    """
+    Stop traffic and verify next time traffic started, shortcut is initiated by backup NHS
+    """
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    if not _verify_iptables():
+        pytest.skip("iptables not installed")
+
+    nhc1 = tgen.gears["nhc1"]
+    host = tgen.gears["host"]
+
+    router_list = tgen.routers()
+
+    # Ping in background to maintain the shorcut
+    global PING_PID
+    PING_PID = host.cmd("ping -W 1 10.5.5.5 >/dev/null 2>&1 & echo $!").strip()
+
+    logger.info("Bringing down nhs1, primary NHRP server.")
+    shutdown_bringup_interface(tgen, "nhs1", "nhs1-gre0", False)
+
+    logger.info("Check NHRP cache on servers and clients")
+    for rname, router in router_list.items():
+        if "nh" not in rname:
+            continue
+        if "nhs1" in rname:
+            continue
+
+        json_file = "{}/{}/nhrp_cache_nhs1_down.json".format(CWD, router.name)
+        expected = json.loads(open(json_file).read())
+        test_func = partial(
+            router_nhrp_json_cmp, router, "show ip nhrp cache json", expected
+        )
+        _, result = topotest.run_and_expect(test_func, None, count=40, wait=0.5)
+
+        assertmsg = '"{}" "show ip nhrp cache" output mismatches'.format(router.name)
+        assert result is None, assertmsg
+
+    logger.info("Check NHRP IPV4 routes on servers and clients")
+    for rname, router in router_list.items():
+        if "nh" not in rname:
+            continue
+        if "nhs1" in rname:
+            continue
+
+        json_file = "{}/{}/nhrp_route_nhs1_down.json".format(CWD, router.name)
+        expected = json.loads(open(json_file).read())
+        test_func = partial(
+            topotest.router_json_cmp, router, "show ip route nhrp json", expected
+        )
+        _, result = topotest.run_and_expect(test_func, None, count=40, wait=0.5)
+
+        assertmsg = '"{}" "show ip route nhrp" output mismatches'.format(router.name)
+        assert result is None, assertmsg
+
+    logger.info("Verify ping is still operational")
+    ping_test(host, "10.5.5.5", 1000, "nhc2 via shortcut")
+
+    logger.info("Verify shortcut is present in routing table")
+    json_file = "{}/{}/nhrp_route_shortcut_nhs1_down.json".format(CWD, nhc1.name)
+    assertmsg = "No nhrp_route file found"
+    assert os.path.isfile(json_file), assertmsg
+
+    expected = json.loads(open(json_file).read())
+    test_func = partial(
+        topotest.router_json_cmp, nhc1, "show ip route nhrp json", expected
+    )
+    _, result = topotest.run_and_expect(test_func, None, count=40, wait=0.5)
+
+    json_file = "{}/{}/nhrp_shortcut_present.json".format(CWD, nhc1.name)
+    expected = json.loads(open(json_file).read())
+    test_func = partial(
+        router_nhrp_json_cmp, nhc1, "show ip nhrp shortcut json", expected
+    )
+    _, result = topotest.run_and_expect(test_func, None, count=40, wait=0.5)
+
+    assertmsg = '"{}" "show ip route nhrp" output mismatches'.format(nhc1.name)
+    assert result is None, assertmsg
+
+    logger.info("Check shortcut is purged with lack of traffic")
+    host.cmd(f"kill {PING_PID}")
+    PING_PID = None
+
+    json_file = "{}/{}/nhrp_route_nhs1_down.json".format(CWD, nhc1.name)
+    assertmsg = "No nhrp_route file found"
+    assert os.path.isfile(json_file), assertmsg
+
+    expected = json.loads(open(json_file).read())
+    test_func = partial(
+        topotest.router_json_cmp, nhc1, "show ip route nhrp json", expected
+    )
+    _, result = topotest.run_and_expect(test_func, None, count=40, wait=0.5)
+
+    assertmsg = '"{}" "show ip route nhrp" output mismatches'.format(nhc1.name)
+    assert result is None, assertmsg
+
+    expected = {"attr": {"entriesCount": 0}}
+    test_func = partial(
+        router_nhrp_json_cmp, nhc1, "show ip nhrp shortcut json", expected
+    )
+    _, result = topotest.run_and_expect(test_func, None, count=60, wait=1)
+
+    assertmsg = '"{}" "show ip nhrp shortcut" output mismatches'.format(nhc1.name)
+    assert result is None, assertmsg
+
+
+def test_memory_leak():
+    "Run the memory leak test and report results."
+    tgen = get_topogen()
+    if not tgen.is_memleak_enabled():
+        pytest.skip("Memory leak test/report is disabled")
+
+    tgen.report_memory_leaks()
+
+
+if __name__ == "__main__":
+    args = ["-s"] + sys.argv[1:]
+    sys.exit(pytest.main(args))

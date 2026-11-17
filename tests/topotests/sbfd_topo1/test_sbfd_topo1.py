@@ -1,0 +1,394 @@
+#!/usr/bin/env python
+
+#
+# test_sbfd_topo1.py
+# basic test cases for sbfd initiator and reflector
+#
+# Copyright (c) 2025 by Alibaba, Inc.
+#
+# Permission to use, copy, modify, and/or distribute this software
+# for any purpose with or without fee is hereby granted, provided
+# that the above copyright notice and this permission notice appear
+# in all copies.
+#
+# THE SOFTWARE IS PROVIDED "AS IS" AND NETDEF DISCLAIMS ALL WARRANTIES
+# WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+# MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL NETDEF BE LIABLE FOR
+# ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY
+# DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
+# WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS
+# ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE
+# OF THIS SOFTWARE.
+#
+
+"""
+<template>.py: Test <template>.
+"""
+
+import os
+import sys
+import pytest
+import json
+import re
+import time
+import pdb
+from functools import partial
+
+# Save the Current Working Directory to find configuration files.
+CWD = os.path.dirname(os.path.realpath(__file__))
+sys.path.append(os.path.join(CWD, "../"))
+
+# pylint: disable=C0413
+# Import topogen and topotest helpers
+from lib import topotest
+from lib.topogen import Topogen, get_topogen
+from lib.topolog import logger
+from lib.common_config import required_linux_kernel_version, step
+from lib.checkping import check_ping
+
+"""
+test_sbfd_topo1.py: test simple sbfd with IPv6 encap. RT1 is sbfd Initiator, RT2 is sbfd Reflector
+
+ +----+----+        +----+----+
+ |         |        |         |
+ |   RT1   |   1    |   RT2   |
+ |         +--------+         |
+ | 2001::10|        | 2001::20|
+ +----+----+        +----+----+
+
+"""
+pytestmark = [pytest.mark.bfdd]
+
+
+def show_bfd_check(router, status, type="echo", encap=None):
+    output = router.cmd("vtysh -c 'show bfd peers'")
+    if encap:
+        # check encap data if any
+        pattern1 = re.compile(r"encap-data {}".format(encap))
+        ret = pattern1.findall(output)
+        if len(ret) <= 0:
+            logger.info("encap-data not match")
+            return False
+
+    # check  status
+    pattern2 = re.compile(r"Status: {}".format(status))
+    ret = pattern2.findall(output)
+    if len(ret) <= 0:
+        logger.info("Status not match")
+        return False
+
+    # check type
+    pattern3 = re.compile(r"Peer Type: {}".format(type))
+    ret = pattern3.findall(output)
+    if len(ret) <= 0:
+        logger.info("Peer Type not match")
+        return False
+
+    logger.info("all check passed")
+    return True
+
+
+def build_topo(tgen):
+    "Test topology builder"
+
+    # This function only purpose is to define allocation and relationship
+    # between routers, switches and hosts.
+    #
+    # Example
+    #
+    # Create 2 routers
+    for routern in range(1, 3):
+        tgen.add_router("r{}".format(routern))
+
+    # Create a switch with just one router connected to it to simulate a
+    # empty network.
+    switch = tgen.add_switch("s1")
+    switch.add_link(tgen.gears["r1"])
+    switch.add_link(tgen.gears["r2"])
+
+
+def setup_module(mod):
+    "Sets up the pytest environment"
+    # This function initiates the topology build with Topogen...
+    tgen = Topogen(build_topo, mod.__name__)
+    # ... and here it calls Mininet initialization functions.
+    tgen.start_topology()
+
+    # This is a sample of configuration loading.
+    router_list = tgen.routers()
+
+    for router in router_list.values():
+        router.load_frr_config(extra_daemons=["bfdd"])
+
+    # After loading the configurations, this function loads configured daemons.
+    tgen.start_router()
+
+    # Verify that we are using the proper version and that the BFD
+    # daemon exists.
+    for router in router_list.values():
+        # Check for Version
+        if router.has_version("<", "5.1"):
+            tgen.set_error("Unsupported FRR version")
+            break
+
+
+def teardown_module(mod):
+    "Teardown the pytest environment"
+    tgen = get_topogen()
+    # This function tears down the whole topology.
+    tgen.stop_topology()
+
+
+# step 1 : config sbfd Initiator and reflector
+def test_sbfd_config_check():
+    "Assert that config sbfd and check sbfd status."
+    # Required linux kernel version for this suite to run.
+    result = required_linux_kernel_version("4.5")
+    if result is not True:
+        pytest.skip("Kernel requirements are not met")
+
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    # config sbfd
+    r1 = tgen.net["r1"]
+    check_ping("r1", "2001::20", True, 10, 1)
+    r1.cmd(
+        "vtysh -c 'config t' -c 'bfd' -c 'peer 2001::20 bfd-mode sbfd-init bfd-name 2-44 local-address 2001::10 remote-discr 1234'"
+    )
+
+    r2 = tgen.net["r2"]
+    r2.cmd(
+        "vtysh -c 'config t' -c 'bfd' -c 'sbfd reflector source-address 2001::20 discriminator 1234'"
+    )
+
+    check_func = partial(show_bfd_check, r1, "up", type="sbfd initiator")
+    success, _ = topotest.run_and_expect(check_func, True, count=15, wait=1)
+    assert success is True, "sbfd not up in 15 seconds"
+
+
+# step 2: shutdown if and no shutdown if then check sbfd status
+def test_sbfd_updown_interface():
+    "Assert that updown interface then check sbfd status."
+    # Required linux kernel version for this suite to run.
+    result = required_linux_kernel_version("4.5")
+    if result is not True:
+        pytest.skip("Kernel requirements are not met")
+
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    r1 = tgen.net["r1"]
+    r2 = tgen.net["r2"]
+
+    # shutdown interface
+    r2.cmd("vtysh -c 'config t' -c 'interface r2-eth0' -c 'shutdown'")
+
+    check_func = partial(show_bfd_check, r1, "down", type="sbfd initiator")
+    success, _ = topotest.run_and_expect(check_func, True, count=15, wait=1)
+    assert success is True, "sbfd not down in 15 seconds after shut"
+
+    # up interface
+    r2.cmd("vtysh -c 'config t' -c 'interface r2-eth0' -c 'no shutdown'")
+    check_func = partial(show_bfd_check, r1, "up", type="sbfd initiator")
+    success, _ = topotest.run_and_expect(check_func, True, count=15, wait=1)
+    assert success is True, "sbfd not up in 15 seconds after no shut"
+
+
+# step 3: change transmit-interval and check sbfd status according to the interval time
+def test_sbfd_change_transmit_interval():
+    "Assert that sbfd status changes align with transmit-interval."
+    # Required linux kernel version for this suite to run.
+    result = required_linux_kernel_version("4.5")
+    if result is not True:
+        pytest.skip("Kernel requirements are not met")
+
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    r1 = tgen.net["r1"]
+    r2 = tgen.net["r2"]
+
+    r1.cmd(
+        "vtysh -c 'config t' -c 'bfd' -c 'peer 2001::20 bfd-mode sbfd-init bfd-name 2-44 local-address 2001::10 remote-discr 1234' -c 'transmit-interval 3000'"
+    )
+    # wait sometime for polling finish
+    time.sleep(1)
+
+    # shutdown interface
+    r2.cmd("vtysh -c 'config t' -c 'interface r2-eth0' -c 'shutdown'")
+
+    # wait enough time for timeout
+    check_func = partial(show_bfd_check, r1, "down", type="sbfd initiator")
+    success, _ = topotest.run_and_expect(check_func, True, count=5, wait=3)
+    assert success is True, "sbfd not down as expected"
+
+    r2.cmd("vtysh -c 'config t' -c 'interface r2-eth0' -c 'no shutdown'")
+    check_func = partial(show_bfd_check, r1, "up", type="sbfd initiator")
+    success, _ = topotest.run_and_expect(check_func, True, count=15, wait=1)
+    assert success is True, "sbfd not up in 15 seconds after no shut"
+
+    r1.cmd(
+        "vtysh -c 'config t' -c 'bfd' -c 'no peer 2001::20 bfd-mode sbfd-init bfd-name 2-44 local-address 2001::10 remote-discr 1234'"
+    )
+    check_func = partial(show_bfd_check, r1, "up", type="sbfd initiator")
+    success, _ = topotest.run_and_expect(check_func, False, count=15, wait=1)
+    assert success is True, "sbfd not deleted as unexpected"
+
+
+# step 4: an sbfd echo back with the hop limit it was sent with stays up
+def test_sbfd_echo_returned_with_hop_limit_255():
+    """
+    Assert that an sbfd echo that comes back with hop limit 255 still counts.
+
+    r2 decapsulates r1's echo (End.DT6) and routes it back; with the hop limit
+    set back to 255, as on a router that decapsulates (USD) without decrementing
+    it, the echo must not be taken for a peer's echo to reflect.
+    """
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    r1 = tgen.net["r1"]
+    r2 = tgen.net["r2"]
+    dt6 = "fc00:20::/128 encap seg6local action End.DT6 table 254 dev r2-eth0"
+    if r2.cmd("ip -6 route add {} && echo ok".format(dt6)).strip() != "ok":
+        pytest.skip("seg6local End.DT6 not supported by the kernel")
+    r1.cmd("ip -6 route add fc00:20::/128 via 2001::20")
+    r1.cmd(
+        "vtysh -c 'config t' -c 'bfd' -c 'peer 2001::10 bfd-mode sbfd-echo bfd-name echo-r2 local-address 2001::10 srv6-source-ipv6 2001::10 srv6-encap-data fc00:20::'"
+    )
+    check_func = partial(show_bfd_check, r1, "up", type="echo", encap="fc00:20::")
+    success, _ = topotest.run_and_expect(check_func, True, count=15, wait=1)
+    assert success is True, "sbfd echo not up in 15 seconds"
+
+    rule = "POSTROUTING -o r2-eth0 -p udp --dport 3785 -j HL --hl-set 255"
+    if r2.cmd("ip6tables -t mangle -A {} && echo ok".format(rule)).strip() != "ok":
+        pytest.skip("ip6tables HL target not available")
+    # up at every sample: a session that went down or is gone fails
+    check_func = partial(show_bfd_check, r1, "up", type="echo", encap="fc00:20::")
+    for sample in range(20):
+        assert (
+            check_func()
+        ), "sbfd echo not up {}s after its echo came back with hop limit 255".format(
+            sample
+        )
+        time.sleep(1)
+
+    r2.cmd("ip6tables -t mangle -D {}".format(rule))
+    r1.cmd(
+        "vtysh -c 'config t' -c 'bfd' -c 'no peer 2001::10 bfd-mode sbfd-echo bfd-name echo-r2 local-address 2001::10 srv6-source-ipv6 2001::10 srv6-encap-data fc00:20::'"
+    )
+
+
+# A command that never returns would hang vtysh, and the test, forever.
+VTYSH_TIMEOUT = 15
+
+
+def bfdd_vtysh(router, *commands):
+    "Run commands in one vtysh call with a time limit. Return its exit code and output."
+    output = router.cmd(
+        "timeout {} vtysh {}; echo rc=$?".format(
+            VTYSH_TIMEOUT, " ".join("-c '{}'".format(c) for c in commands)
+        )
+    )
+    output, _, rc = output.rstrip().rpartition("rc=")
+    rc = int(rc)
+    if rc == 124:
+        # Kill the stuck bfdd. The vtysh calls that topotest makes after the
+        # test have no time limit and would wait for it forever.
+        router.cmd("kill -KILL $(cat /var/run/frr/bfdd.pid)")
+    assert rc != 124, "bfdd did not answer '{}' in {} seconds".format(
+        commands[-1], VTYSH_TIMEOUT
+    )
+    return rc, output
+
+
+def sbfd_reflector_config(router, command):
+    "Run command in the bfd node. Return vtysh's exit code and output."
+    return bfdd_vtysh(router, "configure terminal", "bfd", command)
+
+
+def sbfd_reflector_discrs(router):
+    "Return the set of reflector discriminators in 'show sbfd reflector'."
+    _, output = bfdd_vtysh(router, "show sbfd reflector")
+    discrs = set()
+    for line in output.splitlines():
+        fields = line.split()
+        if fields and fields[0].isdigit():
+            discrs.add(int(fields[0]))
+    return discrs
+
+
+# step 5: discriminator ranges and limits
+def test_sbfd_reflector_discriminator_range():
+    "Assert that discriminator ranges up to 4294967295 add and delete what they cover."
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    r2 = tgen.net["r2"]
+    before = sbfd_reflector_discrs(r2)
+    top = {4294967293, 4294967294, 4294967295}
+
+    step("Add a range that ends at 4294967295")
+    rc, output = sbfd_reflector_config(
+        r2, "sbfd reflector source-address 2001::20 discriminator 4294967293-4294967295"
+    )
+    assert rc == 0, "range 4294967293-4294967295 rejected: {}".format(output)
+    assert sbfd_reflector_discrs(r2) == before | top
+
+    step("Reject illegal discriminators without adding any reflector")
+    for discr, error in [
+        ("4294967295-4294967295", "is illegal"),
+        ("200-100", "is illegal"),
+        ("0", "is illegal"),
+        ("4294967296", "is illegal"),
+        ("100-102 -50", "is illegal"),
+        ("7 abc", "is illegal"),
+        ("1-65536 4294967290", "Too many discriminators (65537)"),
+    ]:
+        rc, output = sbfd_reflector_config(
+            r2, "sbfd reflector source-address 2001::20 discriminator " + discr
+        )
+        assert rc != 0, "discriminator {} accepted".format(discr)
+        assert error in output, "discriminator {}: expected '{}' in: {}".format(
+            discr, error, output
+        )
+        assert sbfd_reflector_discrs(r2) == before | top, "discriminator {}".format(
+            discr
+        )
+
+    step("Add and delete the largest range one command allows")
+    many = set(range(1000001, 1065537))
+    rc, output = sbfd_reflector_config(
+        r2, "sbfd reflector source-address 2001::20 discriminator 1000001-1065536"
+    )
+    assert rc == 0, "range 1000001-1065536 rejected: {}".format(output)
+    assert sbfd_reflector_discrs(r2) == before | top | many
+    rc, output = sbfd_reflector_config(r2, "no sbfd reflector 1000001 1065536")
+    assert rc == 0, "no sbfd reflector 1000001 1065536 failed: {}".format(output)
+    assert sbfd_reflector_discrs(r2) == before | top
+
+    step("Delete a range that ends at 4294967295")
+    rc, output = sbfd_reflector_config(r2, "no sbfd reflector 4294967293 4294967295")
+    assert rc == 0, "no sbfd reflector 4294967293 4294967295 failed: {}".format(output)
+    assert sbfd_reflector_discrs(r2) == before
+
+
+# Memory leak test template
+def test_memory_leak():
+    "Run the memory leak test and report results."
+    tgen = get_topogen()
+    if not tgen.is_memleak_enabled():
+        pytest.skip("Memory leak test/report is disabled")
+
+    tgen.report_memory_leaks()
+
+
+if __name__ == "__main__":
+    args = ["-s"] + sys.argv[1:]
+    sys.exit(pytest.main(args))

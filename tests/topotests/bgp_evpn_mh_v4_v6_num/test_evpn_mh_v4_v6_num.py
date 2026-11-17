@@ -1,0 +1,2190 @@
+#!/usr/bin/env python
+# SPDX-License-Identifier: ISC
+
+#
+# test_evpn_mh_v6_numbered.py
+#
+# Copyright (c) 2020 by
+# Nvidia Corporation
+# Chirag Shah
+# Copyright (c) 2025 by
+# IPv6 VTEP EBGP Numbered Extensions
+#
+
+"""
+test_evpn_mh_v6_numbered.py: Testing EVPN multihoming with IPv6 VTEP addresses
+and EBGP numbered peering
+
+This is an IPv6 VTEP variant with EBGP numbered peering and unified FRR config
+"""
+
+import os
+import sys
+import subprocess
+from functools import partial
+from ipaddress import ip_network
+
+import pytest
+import json
+import platform
+import time
+import re
+
+pytestmark = [
+    pytest.mark.bgpd,
+    pytest.mark.evpn,
+    pytest.mark.mgmtd,
+    pytest.mark.pim6d,
+]
+
+# Save the Current Working Directory to find configuration files.
+CWD = os.path.dirname(os.path.realpath(__file__))
+sys.path.append(os.path.join(CWD, "../"))
+
+# pylint: disable=C0413
+# Import topogen and topotest helpers
+from lib import topotest
+from lib.common_config import kill_router_daemons, start_router_daemons
+from lib.evpn import (
+    evpn_verify_bgp_es_vtep,
+    evpn_verify_df_role,
+    evpn_verify_es_kernel_nexthop,
+    evpn_verify_mh_mac,
+    evpn_verify_protodown_reason,
+    evpn_verify_zebra_es_vtep,
+)
+from lib import evpn as evpn_lib
+
+# Required to instantiate the topology builder class.
+from lib.common_config import (
+    create_address_on_interface,
+    create_interface_in_kernel,
+    shutdown_bringup_interface_in_kernel,
+)
+from lib.topogen import Topogen, TopoRouter, get_topogen
+from lib.topolog import logger
+
+#####################################################
+##
+##   Network Topology Definition
+##
+## Same topology as test_evpn_mh.py but with IPv6 VTEP addresses
+## and EBGP numbered peering
+#####################################################
+
+
+def setup_module(module):
+    if not topotest.platform_has_vrf():
+        pytest.skip("platform does not support VRF")
+
+    if not topotest.platform_has_evpn():
+        pytest.skip("platform does not support EVPN")
+
+    if not topotest.platform_has_pimv6():
+        pytest.skip("platform does not support PIMv6")
+
+
+def build_topo(tgen):
+    """
+    EVPN Multihoming Topology -
+    1. Two level CLOS
+    2. Two spine switches - spine1, spine2
+    3. Two leaf switches - leaf1, leaf2
+    4. Two racks with Top-of-Rack switches per rack - tormx1, tormx2
+    5. Two dual attached hosts per-rack - hostdx1, hostdx2
+    """
+
+    tgen.add_router("spine1")
+    tgen.add_router("spine2")
+    tgen.add_router("leaf1")
+    tgen.add_router("leaf2")
+    tgen.add_router("torm11")
+    tgen.add_router("torm12")
+    tgen.add_router("torm21")
+    tgen.add_router("torm22")
+    tgen.add_router("hostd11")
+    tgen.add_router("hostd12")
+    tgen.add_router("hostd21")
+    tgen.add_router("hostd22")
+
+    ##################### spine1 ########################
+    # spine1-eth0 is connected to leaf1-eth0
+    switch = tgen.add_switch("sw1")
+    switch.add_link(tgen.gears["spine1"])
+    switch.add_link(tgen.gears["leaf1"])
+
+    # spine1-eth1 is connected to leaf2-eth0
+    switch = tgen.add_switch("sw2")
+    switch.add_link(tgen.gears["spine1"])
+    switch.add_link(tgen.gears["leaf2"])
+
+    # spine2-eth0 is connected to leaf1-eth1
+    switch = tgen.add_switch("sw3")
+    switch.add_link(tgen.gears["spine2"])
+    switch.add_link(tgen.gears["leaf1"])
+
+    # spine2-eth1 is connected to leaf2-eth1
+    switch = tgen.add_switch("sw4")
+    switch.add_link(tgen.gears["spine2"])
+    switch.add_link(tgen.gears["leaf2"])
+
+    ################## leaf1 ##########################
+    # leaf1-eth2 is connected to torm11-eth0
+    switch = tgen.add_switch("sw5")
+    switch.add_link(tgen.gears["leaf1"])
+    switch.add_link(tgen.gears["torm11"])
+
+    # leaf1-eth3 is connected to torm12-eth0
+    switch = tgen.add_switch("sw6")
+    switch.add_link(tgen.gears["leaf1"])
+    switch.add_link(tgen.gears["torm12"])
+
+    # leaf1-eth4 is connected to torm21-eth0
+    switch = tgen.add_switch("sw7")
+    switch.add_link(tgen.gears["leaf1"])
+    switch.add_link(tgen.gears["torm21"])
+
+    # leaf1-eth5 is connected to torm22-eth0
+    switch = tgen.add_switch("sw8")
+    switch.add_link(tgen.gears["leaf1"])
+    switch.add_link(tgen.gears["torm22"])
+
+    ##################### leaf2 ########################
+    # leaf2-eth2 is connected to torm11-eth1
+    switch = tgen.add_switch("sw9")
+    switch.add_link(tgen.gears["leaf2"])
+    switch.add_link(tgen.gears["torm11"])
+
+    # leaf2-eth3 is connected to torm12-eth1
+    switch = tgen.add_switch("sw10")
+    switch.add_link(tgen.gears["leaf2"])
+    switch.add_link(tgen.gears["torm12"])
+
+    # leaf2-eth4 is connected to torm21-eth1
+    switch = tgen.add_switch("sw11")
+    switch.add_link(tgen.gears["leaf2"])
+    switch.add_link(tgen.gears["torm21"])
+
+    # leaf2-eth5 is connected to torm22-eth1
+    switch = tgen.add_switch("sw12")
+    switch.add_link(tgen.gears["leaf2"])
+    switch.add_link(tgen.gears["torm22"])
+
+    ##################### torm11 ########################
+    # torm11-eth2 is connected to hostd11-eth0
+    switch = tgen.add_switch("sw13")
+    switch.add_link(tgen.gears["torm11"])
+    switch.add_link(tgen.gears["hostd11"])
+
+    # torm11-eth3 is connected to hostd12-eth0
+    switch = tgen.add_switch("sw14")
+    switch.add_link(tgen.gears["torm11"])
+    switch.add_link(tgen.gears["hostd12"])
+
+    ##################### torm12 ########################
+    # torm12-eth2 is connected to hostd11-eth1
+    switch = tgen.add_switch("sw15")
+    switch.add_link(tgen.gears["torm12"])
+    switch.add_link(tgen.gears["hostd11"])
+
+    # torm12-eth3 is connected to hostd12-eth1
+    switch = tgen.add_switch("sw16")
+    switch.add_link(tgen.gears["torm12"])
+    switch.add_link(tgen.gears["hostd12"])
+
+    ##################### torm21 ########################
+    # torm21-eth2 is connected to hostd21-eth0
+    switch = tgen.add_switch("sw17")
+    switch.add_link(tgen.gears["torm21"])
+    switch.add_link(tgen.gears["hostd21"])
+
+    # torm21-eth3 is connected to hostd22-eth0
+    switch = tgen.add_switch("sw18")
+    switch.add_link(tgen.gears["torm21"])
+    switch.add_link(tgen.gears["hostd22"])
+
+    ##################### torm22 ########################
+    # torm22-eth2 is connected to hostd21-eth1
+    switch = tgen.add_switch("sw19")
+    switch.add_link(tgen.gears["torm22"])
+    switch.add_link(tgen.gears["hostd21"])
+
+    # torm22-eth3 is connected to hostd22-eth1
+    switch = tgen.add_switch("sw20")
+    switch.add_link(tgen.gears["torm22"])
+    switch.add_link(tgen.gears["hostd22"])
+
+
+#####################################################
+##
+##   Tests starting
+##
+#####################################################
+
+TOR_IPS = {
+    "ipv4": {
+        "torm11": "192.168.100.15",
+        "torm12": "192.168.100.16",
+        "torm21": "192.168.100.17",
+        "torm22": "192.168.100.18",
+    },
+    "ipv6": {
+        "torm11": "2001:db8:100::15",
+        "torm12": "2001:db8:100::16",
+        "torm21": "2001:db8:100::17",
+        "torm22": "2001:db8:100::18",
+    },
+}
+
+SVI_IPS = {
+    "ipv4": {
+        "torm11": "45.0.0.2",
+        "torm12": "45.0.0.3",
+        "torm21": "45.0.0.4",
+        "torm22": "45.0.0.5",
+    },
+    "ipv6": {
+        "torm11": "2001:db8:45::2",
+        "torm12": "2001:db8:45::3",
+        "torm21": "2001:db8:45::4",
+        "torm22": "2001:db8:45::5",
+    },
+}
+
+# Runtime-selected active maps (set from fixture based on ip_version).
+active_ip_version = "ipv6"
+tor_ips = TOR_IPS[active_ip_version]
+svi_ips = SVI_IPS[active_ip_version]
+tor_ips_rack_1 = {"torm11": tor_ips["torm11"], "torm12": tor_ips["torm12"]}
+tor_ips_rack_2 = {"torm21": tor_ips["torm21"], "torm22": tor_ips["torm22"]}
+
+host_es_map = {
+    "hostd11": "03:44:38:39:ff:ff:01:00:00:01",
+    "hostd12": "03:44:38:39:ff:ff:01:00:00:02",
+    "hostd21": "03:44:38:39:ff:ff:02:00:00:01",
+    "hostd22": "03:44:38:39:ff:ff:02:00:00:02",
+}
+
+# Underlay IPv6 addresses for TOR uplink interfaces. These mirror the interface
+# addresses configured in the per-router frr.conf files, but are applied early
+# using Linux iproute2 so that zebra/BGP always see stable interface addresses,
+# even when configuration is loaded via tools/frr-reload.py.
+tor_uplink_ipv6 = {
+    "torm11": {
+        "torm11-eth0": "2001:db8:1::0/127",
+        "torm11-eth1": "2001:db8:5::0/127",
+    },
+    "torm12": {
+        "torm12-eth0": "2001:db8:2::0/127",
+        "torm12-eth1": "2001:db8:6::0/127",
+    },
+    "torm21": {
+        "torm21-eth0": "2001:db8:3::0/127",
+        "torm21-eth1": "2001:db8:7::0/127",
+    },
+    "torm22": {
+        "torm22-eth0": "2001:db8:4::0/127",
+        "torm22-eth1": "2001:db8:8::0/127",
+    },
+}
+
+tor_uplink_ipv4 = {
+    "torm11": {
+        "torm11-eth0": "192.168.1.2/24",
+        "torm11-eth1": "192.168.5.2/24",
+    },
+    "torm12": {
+        "torm12-eth0": "192.168.2.2/24",
+        "torm12-eth1": "192.168.6.2/24",
+    },
+    "torm21": {
+        "torm21-eth0": "192.168.3.2/24",
+        "torm21-eth1": "192.168.7.2/24",
+    },
+    "torm22": {
+        "torm22-eth0": "192.168.4.2/24",
+        "torm22-eth1": "192.168.8.2/24",
+    },
+}
+
+# Logical description of VLAN/VNI layout so we avoid hard-coding numbers
+# throughout the helper functions.
+#
+# - VLAN 1000, 1001 in vrf1, VNIs 1000, 1001
+# - VLAN 1002, 1003 in vrf2, VNIs 1002, 1003
+VLAN_VNI_VRF = {
+    1000: (1000, "vrf1"),
+    1001: (1001, "vrf1"),
+    1002: (1002, "vrf2"),
+    1003: (1003, "vrf2"),
+}
+
+# L3VNIs:
+# - vrf1 -> L3VNI 4000 (VLAN 4000)
+# - vrf2 -> L3VNI 4001 (VLAN 4001)
+L3VNI_VRF = {
+    4000: "vrf1",
+    4001: "vrf2",
+}
+
+# Per-TOR IPv4 addresses for VRF devices. These are assigned directly to the
+# VRF interfaces (vrf1 and vrf2) as /32 loopback-style addresses in the
+# 10.1.x.x range, unique per TOR.
+VRF_IPV4 = {
+    "torm11": {"vrf1": "10.1.11.1/32", "vrf2": "10.1.11.2/32"},
+    "torm12": {"vrf1": "10.1.12.1/32", "vrf2": "10.1.12.2/32"},
+    "torm21": {"vrf1": "10.1.21.1/32", "vrf2": "10.1.21.2/32"},
+    "torm22": {"vrf1": "10.1.22.1/32", "vrf2": "10.1.22.2/32"},
+}
+
+
+def _normalize_prefix_for_ip_show(prefix):
+    """
+    Given a prefix string as used in `ip -6 addr add` (e.g. "2001:db8:1::0/127"),
+    return the normalized form that `ip -6 addr show` prints (e.g. "2001:db8:1::/127").
+    """
+    try:
+        net = ip_network(prefix, strict=False)
+        return str(net)
+    except ValueError:
+        # Fallback: just return what we were given
+        return prefix
+
+
+def check_underlay_and_bgp_ipv6(dut, lo_prefix, uplink_prefixes, neighbors):
+    """
+    Generic helper to verify:
+
+    - Kernel IPv6 address on loopback matches `lo_prefix`
+    - Kernel IPv6 addresses on all uplink interfaces match `uplink_prefixes`
+    - All BGP IPv6 unicast neighbors in `neighbors` are Established
+    """
+
+    # Check loopback IPv6
+    lo_out = dut.run("ip -6 addr show dev lo")
+    if lo_prefix not in lo_out:
+        return f"{dut.name}: loopback IPv6 missing in kernel: {lo_out}"
+
+    # Check uplink IPv6 addresses
+    for ifname, prefix in uplink_prefixes.items():
+        expected = _normalize_prefix_for_ip_show(prefix)
+        out = dut.run(f"ip -6 addr show dev {ifname}")
+        if expected not in out:
+            return f"{dut.name}: {ifname} IPv6 missing in kernel: {out}"
+
+    # Check BGP IPv6 unicast neighbors
+    summary = dut.vtysh_cmd("show bgp ipv6 unicast summary json")
+    try:
+        js = json.loads(summary)
+    except Exception as exc:  # pragma: no cover - defensive
+        return f"{dut.name}: failed to parse BGP IPv6 summary json: {summary} ({exc})"
+
+    # Prefer modern layout, fall back if needed
+    peers = js.get("ipv6Unicast", {}).get("peers")
+    if not isinstance(peers, dict):
+        peers = js.get("peers", {}) if isinstance(js.get("peers"), dict) else {}
+
+    for neigh in neighbors:
+        state = peers.get(neigh, {}).get("state", "")
+        if state != "Established":
+            return f"{dut.name}: neighbor {neigh} not Established (state={state})"
+
+    return None
+
+
+def check_underlay_and_bgp_ipv4(dut, lo_prefix, uplink_prefixes, neighbors):
+    """
+    Generic helper to verify:
+    - Kernel IPv4 address on loopback matches `lo_prefix`
+    - Kernel IPv4 addresses on all uplink interfaces match `uplink_prefixes`
+    - All BGP IPv4 unicast neighbors in `neighbors` are Established
+    """
+    lo_out = dut.run("ip -4 addr show dev lo")
+    if lo_prefix not in lo_out:
+        return f"{dut.name}: loopback IPv4 missing in kernel: {lo_out}"
+
+    for ifname, prefix in uplink_prefixes.items():
+        out = dut.run(f"ip -4 addr show dev {ifname}")
+        if prefix not in out:
+            return f"{dut.name}: {ifname} IPv4 missing in kernel: {out}"
+
+    summary = dut.vtysh_cmd("show bgp ipv4 unicast summary json")
+    try:
+        js = json.loads(summary)
+    except Exception as exc:  # pragma: no cover - defensive
+        return f"{dut.name}: failed to parse BGP IPv4 summary json: {summary} ({exc})"
+
+    peers = js.get("ipv4Unicast", {}).get("peers")
+    if not isinstance(peers, dict):
+        peers = js.get("peers", {}) if isinstance(js.get("peers"), dict) else {}
+
+    for neigh in neighbors:
+        state = peers.get(neigh, {}).get("state", "")
+        if state != "Established":
+            return f"{dut.name}: neighbor {neigh} not Established (state={state})"
+
+    return None
+
+
+def config_bond(node, bond_name, bond_members, bond_ad_sys_mac, br):
+    """
+    Used to setup bonds on the TORs and hosts for MH
+    """
+    node.run("ip link add dev %s type bond mode 802.3ad" % bond_name)
+    node.run("ip link set dev %s type bond lacp_rate 1" % bond_name)
+    node.run("ip link set dev %s type bond miimon 100" % bond_name)
+    node.run("ip link set dev %s type bond xmit_hash_policy layer3+4" % bond_name)
+    node.run("ip link set dev %s type bond min_links 1" % bond_name)
+    node.run(
+        "ip link set dev %s type bond ad_actor_system %s" % (bond_name, bond_ad_sys_mac)
+    )
+
+    for bond_member in bond_members:
+        shutdown_bringup_interface_in_kernel(node.tgen, node.name, bond_member, False)
+        node.run("ip link set dev %s master %s" % (bond_member, bond_name))
+        shutdown_bringup_interface_in_kernel(node.tgen, node.name, bond_member, True)
+
+    shutdown_bringup_interface_in_kernel(node.tgen, node.name, bond_name, True)
+
+    # if bridge is specified add the bond as a bridge member
+    if br:
+        node.run(" ip link set dev %s master bridge" % bond_name)
+        node.run("/sbin/bridge link set dev %s priority 8" % bond_name)
+        node.run("/sbin/bridge vlan del vid 1 dev %s" % bond_name)
+        node.run("/sbin/bridge vlan del vid 1 untagged pvid dev %s" % bond_name)
+        node.run("/sbin/bridge vlan add vid 1000 dev %s" % bond_name)
+        node.run("/sbin/bridge vlan add vid 1000 untagged pvid dev %s" % bond_name)
+
+
+def config_mcast_tunnel_termination_device(node):
+    """
+    The kernel requires a device to terminate VxLAN multicast tunnels
+    when EVPN-PIM is used for flooded traffic
+    """
+    create_interface_in_kernel(node.tgen, node.name, "ipmr-lo")
+    node.run("ip link set dev ipmr-lo mtu 16000")
+    node.run("ip link set dev ipmr-lo mode dormant")
+    shutdown_bringup_interface_in_kernel(node.tgen, node.name, "ipmr-lo", True)
+
+
+def config_bridge(node):
+    """
+    Create a VLAN aware bridge for SVD:
+    - Single bridge `br_default`
+    - All L2 VLANs from VLAN_VNI_VRF and L3 VLANs from L3VNI_VRF
+    """
+    node.run("ip link del br_default 2>/dev/null || true")
+    node.run("ip link add dev br_default type bridge stp_state 0")
+    node.run("ip link set dev br_default type bridge vlan_filtering 1")
+    node.run("ip link set dev br_default mtu 9216")
+    node.run("ip link set dev br_default type bridge ageing_time 1800")
+    node.run("ip link set dev br_default type bridge mcast_snooping 0")
+    node.run("ip link set dev br_default type bridge vlan_stats_enabled 1")
+    shutdown_bringup_interface_in_kernel(node.tgen, node.name, "br_default", True)
+    # Self VLAN entries for all L2VNIs and L3VNI VLANs derived from the maps
+    for vid in sorted(VLAN_VNI_VRF.keys()):
+        node.run(f"/sbin/bridge vlan add vid {vid} dev br_default self")
+    for vid in sorted(L3VNI_VRF.keys()):
+        node.run(f"/sbin/bridge vlan add vid {vid} dev br_default self")
+
+
+def config_vxlan(node, node_ip):
+    """
+    Create a Single VXLAN Device (SVD) `vxlan48` and add it to the bridge.
+    All VLANs in VLAN_VNI_VRF and L3VNI_VRF are mapped to their VNIs via
+    tunnel_info, following the same pattern as `setup_vtep` in
+    bgp_evpn_three_tier_clos_topo1.
+    """
+    # Cleanup any existing vxlan48
+    node.run("ip link del vxlan48 2>/dev/null || true")
+
+    # Create VXLAN with IPv6 local address; BGP EVPN will control remote
+    # endpoints via the `external` flag.
+    node.run(
+        "ip link add vxlan48 type vxlan dstport 4789 local %s "
+        "nolearning external ttl 64 ageing 18000" % node_ip
+    )
+    node.run("ip link set dev vxlan48 mtu 9152")
+    node.run("ip link set dev vxlan48 master br_default")
+    # Mirror SVD behavior: enable VLAN tunneling, suppress ARP/ND, disable learning
+    node.run("/sbin/bridge link set dev vxlan48 vlan_tunnel on")
+    node.run("/sbin/bridge link set dev vxlan48 neigh_suppress on")
+    node.run("/sbin/bridge link set dev vxlan48 learning off")
+    node.run("/sbin/bridge vlan del vid 1 dev vxlan48")
+    node.run("/sbin/bridge vlan del vid 1 untagged pvid dev vxlan48")
+
+    # Map VLANs to VNIs using the logical maps
+    vni_map = {}
+    for vid, (vni, _vrf) in VLAN_VNI_VRF.items():
+        vni_map[vid] = vni
+    for vni, _vrf in L3VNI_VRF.items():
+        vni_map[vni] = vni
+
+    for vid, vni in vni_map.items():
+        # First add the VLAN membership on vxlan48, then add tunnel_info id
+        node.run(f"/sbin/bridge vlan add dev vxlan48 vid {vid}")
+        node.run(f"/sbin/bridge vlan add dev vxlan48 vid {vid} tunnel_info id {vni}")
+
+    shutdown_bringup_interface_in_kernel(node.tgen, node.name, "vxlan48", True)
+
+
+def config_l3vni(node, node_ip):
+    """
+    L3VNI is handled by VLAN 4001 mapped to VNI 4001 on `vxlan48`, so this
+    function becomes a no-op placeholder kept for compatibility.
+    """
+    del node
+    del node_ip
+
+
+def config_svi(node, svi_pip):
+    """
+    Create SVIs and attach them to the appropriate VRFs:
+    - VLAN 1000, 1001 in vrf1
+    - VLAN 1002, 1003 in vrf2
+
+    IPv6 addressing is configured only on VLAN 1000 using `svi_pip`, to
+    provide a single anycast GW for vrf1, mirroring the previous test.
+    """
+    # Create SVIs for all access VLANs based on VLAN_VNI_VRF
+    for vid, (_vni, vrf) in VLAN_VNI_VRF.items():
+        vlan_name = f"vlan{vid}"
+        node.run(
+            f"ip link add link br_default name {vlan_name} "
+            f"type vlan id {vid} protocol 802.1q"
+        )
+        node.run(f"ip link set dev {vlan_name} master {vrf}")
+        shutdown_bringup_interface_in_kernel(node.tgen, node.name, vlan_name, True)
+        node.run(f"/sbin/sysctl net.ipv6.conf.{vlan_name}.accept_dad=0")
+        node.run(f"/sbin/sysctl net.ipv6.conf.{vlan_name}.dad_transmits=0")
+
+    if active_ip_version == "ipv6":
+        # Assign IPv6 anycast GW only to VLAN 1000 in vrf1
+        create_address_on_interface(node.tgen, node.name, "vlan1000", "%s/64" % svi_pip)
+    else:
+        # Preserve legacy IPv4 anycast gateway behavior used by MAC learning tests.
+        create_address_on_interface(node.tgen, node.name, "vlan1000", "%s/24" % svi_pip)
+        node.run("/sbin/sysctl net.ipv4.conf.vlan1000.arp_accept=1")
+        node.run("ip link add link vlan1000 name vlan1000-v0 type macvlan mode private")
+        node.run("ip link set dev vlan1000-v0 address 00:00:5e:00:01:01")
+        shutdown_bringup_interface_in_kernel(node.tgen, node.name, "vlan1000-v0", True)
+        create_address_on_interface(node.tgen, node.name, "vlan1000-v0", "45.0.0.1/24")
+
+
+def config_vrf_l3vni(node):
+    """
+    Create VRFs and the L3VNI VLAN interfaces based on L3VNI_VRF.
+    vrf1 and vrf2 are created here so that config_svi() can attach SVIs.
+    """
+    # Create VRF devices for all VRFs referenced in L3VNI_VRF
+    # Use static table IDs for now: vrf1 -> 1001, vrf2 -> 1002
+    vrf_tables = {"vrf1": 1001, "vrf2": 1002}
+    for vrf, table in vrf_tables.items():
+        node.run(f"ip link add {vrf} type vrf table {table} 2>/dev/null || true")
+        shutdown_bringup_interface_in_kernel(node.tgen, node.name, vrf, True)
+
+    # Create L3VNI VLAN interfaces and attach them to the appropriate VRFs
+    for l3vni, vrf in L3VNI_VRF.items():
+        vlan_name = f"vlan{l3vni}"
+        node.run(
+            f"ip link add link br_default name {vlan_name} "
+            f"type vlan id {l3vni} protocol 802.1q"
+        )
+        node.run(f"ip link set dev {vlan_name} master {vrf}")
+        shutdown_bringup_interface_in_kernel(node.tgen, node.name, vlan_name, True)
+        node.run(f"/sbin/sysctl net.ipv6.conf.{vlan_name}.accept_dad=0")
+        node.run(f"/sbin/sysctl net.ipv6.conf.{vlan_name}.dad_transmits=0")
+
+
+def config_tor(tor_name, tor, tor_ip, svi_pip, ip_version):
+    """
+    Create the bond/vxlan-bridge on the TOR which acts as VTEP and EPN-PE
+    """
+    # Add IPv4 and IPv6 addresses to loopback interface for VTEP
+    # These must be added before creating VXLAN device.
+    # They match the addresses in frr.conf for consistency and are applied
+    # via Linux iproute2 so that zebra/BGP learn them from the kernel.
+    tor_id = tor_name.replace("torm", "")  # Extract number: 11, 12, 21, 22
+    if tor_id == "11":
+        ipv4_lo = "10.0.0.15"
+    elif tor_id == "12":
+        ipv4_lo = "10.0.0.16"
+    elif tor_id == "21":
+        ipv4_lo = "10.0.0.17"
+    elif tor_id == "22":
+        ipv4_lo = "10.0.0.18"
+
+    if ip_version == "ipv4":
+        create_address_on_interface(tor.tgen, tor.name, "lo", "%s/32" % tor_ip)
+    else:
+        create_address_on_interface(tor.tgen, tor.name, "lo", "%s/32" % ipv4_lo)
+        create_address_on_interface(tor.tgen, tor.name, "lo", "%s/128" % tor_ip)
+
+    # Add IPv6 underlay addresses on uplink interfaces using iproute2 as well.
+    # This avoids timing/race issues where, when using frr-reload.py, BGP may
+    # come up before interface addresses have been fully programmed by zebra
+    # from the FRR config, leading to incorrect (e.g. IPv4-mapped IPv6) nexthops.
+    uplinks = tor_uplink_ipv4.get(tor_name, {})
+    if ip_version == "ipv6":
+        uplinks = tor_uplink_ipv6.get(tor_name, {})
+    for ifname, prefix in uplinks.items():
+        create_address_on_interface(tor.tgen, tor.name, ifname, prefix)
+
+    # create VRFs and L3VNI VLANs based on L3VNI_VRF
+    config_bridge(tor)
+    config_vxlan(tor, tor_ip)
+    config_vrf_l3vni(tor)
+
+    # Assign per-VRF IPv4 addresses (10.1.x.x/32) on vrf1 and vrf2 devices so
+    # each TOR has unique loopback-style addresses in each VRF.
+    vrf_ips = VRF_IPV4.get(tor_name, {})
+    for vrf, addr in vrf_ips.items():
+        create_address_on_interface(tor.tgen, tor.name, vrf, addr)
+
+    # create hostbonds; we will attach them to the bridge explicitly
+    if "torm1" in tor_name:
+        sys_mac = "44:38:39:ff:ff:01"
+    else:
+        sys_mac = "44:38:39:ff:ff:02"
+    bond_member = tor_name + "-eth2"
+    config_bond(tor, "hostbond1", [bond_member], sys_mac, None)
+
+    bond_member = tor_name + "-eth3"
+    config_bond(tor, "hostbond2", [bond_member], sys_mac, None)
+
+    # Attach host bonds to bridge with VLANs:
+    # - hostbond1 carries VLAN 1000 (vrf1)
+    # - hostbond2 carries VLAN 1001 (vrf1)
+    for bond, vid in (("hostbond1", 1000), ("hostbond2", 1001)):
+        tor.run(f"ip link set dev {bond} master br_default")
+        tor.run(f"/sbin/bridge vlan del vid 1 dev {bond}")
+        tor.run(f"/sbin/bridge vlan del vid 1 untagged pvid dev {bond}")
+        tor.run(f"/sbin/bridge vlan add vid {vid} dev {bond}")
+        tor.run(f"/sbin/bridge vlan add vid {vid} pvid untagged dev {bond}")
+
+    # create SVI for VLAN 1000 in vrf1 (others can be added similarly as needed)
+    config_svi(tor, svi_pip)
+
+
+def setup_vtep_mh(tgen, tor_name, tor_ip, svi_pip, ip_version):
+    """
+    Configure SVD VXLAN (`vxlan48`) and bridge (`br_default`) on a TOR VTEP
+    in a manner similar to `setup_vtep` from bgp_evpn_three_tier_clos_topo1:
+    - Clean up any existing SVD state
+    - Create a single VLAN-aware bridge
+    - Create a single VXLAN device for all VNIs (L2 and L3)
+    - Create VRFs and L3VNI VLANs for vrf1 (4000) and vrf2 (4001)
+    - Attach host-facing bonds to the bridge with appropriate VLANs
+    """
+    tor = tgen.gears[tor_name]
+
+    # Cleanup any existing SVD-related interfaces
+    cleanup_cmds = [
+        # SVIs and L3VNI VLANs
+        ("down", "vlan1000"),
+        ("down", "vlan1001"),
+        ("down", "vlan1002"),
+        ("down", "vlan1003"),
+        ("down", "vlan4000"),
+        ("down", "vlan4001"),
+        "ip link del vlan1000 2>/dev/null || true",
+        "ip link del vlan1001 2>/dev/null || true",
+        "ip link del vlan1002 2>/dev/null || true",
+        "ip link del vlan1003 2>/dev/null || true",
+        "ip link del vlan4000 2>/dev/null || true",
+        "ip link del vlan4001 2>/dev/null || true",
+        # VXLAN and bridge
+        ("down", "vxlan48"),
+        "ip link del vxlan48 2>/dev/null || true",
+        ("down", "br_default"),
+        "ip link del br_default 2>/dev/null || true",
+        # VRFs
+        ("down", "vrf1"),
+        ("down", "vrf2"),
+        "ip link del vrf1 2>/dev/null || true",
+        "ip link del vrf2 2>/dev/null || true",
+    ]
+    for cmd in cleanup_cmds:
+        if isinstance(cmd, tuple):
+            shutdown_bringup_interface_in_kernel(
+                tor.tgen, tor.name, cmd[1], cmd[0] == "up"
+            )
+            continue
+        tor.run(cmd)
+
+    # Now configure SVD data plane and host bonds using existing helper
+    config_tor(tor_name, tor, tor_ip, svi_pip, ip_version)
+
+
+def config_tors(tgen, tors, ip_version):
+    for tor_name in tors:
+        setup_vtep_mh(
+            tgen,
+            tor_name,
+            tor_ips.get(tor_name),
+            svi_ips.get(tor_name),
+            ip_version,
+        )
+
+
+def compute_host_ip_mac(host_name):
+    host_id = host_name.split("hostd")[1]
+    if active_ip_version == "ipv6":
+        host_ip = "2001:db8:45::" + host_id + "/64"
+    else:
+        host_ip = "45.0.0." + host_id + "/24"
+    host_mac = "00:00:00:00:00:" + host_id
+
+    return host_ip, host_mac
+
+
+def config_host(host_name, host):
+    """
+    Create the dual-attached bond on host nodes for MH
+    """
+    bond_members = []
+    bond_members.append(host_name + "-eth0")
+    bond_members.append(host_name + "-eth1")
+    bond_name = "torbond"
+    config_bond(host, bond_name, bond_members, "00:00:00:00:00:00", None)
+
+    host_ip, host_mac = compute_host_ip_mac(host_name)
+    create_address_on_interface(host.tgen, host.name, bond_name, host_ip)
+    host.run("ip link set dev %s address %s" % (bond_name, host_mac))
+
+
+def config_hosts(tgen, hosts):
+    for host_name in hosts:
+        host = tgen.gears[host_name]
+        config_host(host_name, host)
+
+
+def disable_dad_on_all_interfaces(tgen):
+    """
+    Disable DAD (Duplicate Address Detection) on all interfaces for all routers.
+    This is necessary to prevent IPv6 address installation failures in test environments.
+    """
+    router_list = tgen.routers()
+    for rname, router in router_list.items():
+        # Disable DAD globally for all interfaces
+        router.run("/sbin/sysctl -w net.ipv6.conf.all.accept_dad=0 2>/dev/null || true")
+        router.run(
+            "/sbin/sysctl -w net.ipv6.conf.all.dad_transmits=0 2>/dev/null || true"
+        )
+        router.run(
+            "/sbin/sysctl -w net.ipv6.conf.default.accept_dad=0 2>/dev/null || true"
+        )
+        router.run(
+            "/sbin/sysctl -w net.ipv6.conf.default.dad_transmits=0 2>/dev/null || true"
+        )
+
+        # Get list of all interfaces and disable DAD on each
+        try:
+            # Get all interfaces
+            output = router.run(
+                "ip link show | grep -E '^[0-9]+:' | awk -F': ' '{print $2}' | awk '{print $1}'"
+            )
+            interfaces = [line.strip() for line in output.split("\n") if line.strip()]
+
+            for intf in interfaces:
+                # Skip loopback and special interfaces
+                if intf in ["lo", "ipmr-lo"]:
+                    continue
+                # Disable DAD on this interface
+                router.run(
+                    "/sbin/sysctl -w net.ipv6.conf.{}.accept_dad=0 2>/dev/null || true".format(
+                        intf
+                    )
+                )
+                router.run(
+                    "/sbin/sysctl -w net.ipv6.conf.{}.dad_transmits=0 2>/dev/null || true".format(
+                        intf
+                    )
+                )
+        except Exception as e:
+            logger.warning(
+                "Failed to disable DAD on interfaces for {}: {}".format(rname, e)
+            )
+
+
+@pytest.fixture(scope="module", params=["ipv4", "ipv6"])
+def tgen_and_ip_version(request):
+    """
+    Parametrized fixture to run the multihoming topology with IPv4 or IPv6 underlay.
+
+    Supports both IPv4 and IPv6 underlay variants using per-version configs.
+    """
+
+    ip_version = request.param
+    global active_ip_version, tor_ips, svi_ips, tor_ips_rack_1, tor_ips_rack_2
+    active_ip_version = ip_version
+    tor_ips = TOR_IPS[ip_version]
+    svi_ips = SVI_IPS[ip_version]
+    tor_ips_rack_1 = {"torm11": tor_ips["torm11"], "torm12": tor_ips["torm12"]}
+    tor_ips_rack_2 = {"torm21": tor_ips["torm21"], "torm22": tor_ips["torm22"]}
+
+    # Build topology
+    tgen = Topogen(build_topo, request.module.__name__)
+    tgen.start_topology()
+
+    # Basic kernel requirement check (same as original test)
+    krel = platform.release()
+    if topotest.version_cmp(krel, "4.19") < 0:
+        tgen.errors = "kernel 4.19 needed for multihoming tests"
+        pytest.skip(tgen.errors)
+
+    # Configure TORs and hosts for selected IP version
+    tors = ["torm11", "torm12", "torm21", "torm22"]
+    config_tors(tgen, tors, ip_version)
+
+    # CRITICAL: Enable IPv6 and disable DAD BEFORE starting daemons
+    # This must be done before zebra tries to configure IPv6 addresses
+    router_list = tgen.routers()
+    for router in router_list.values():
+        # Enable IPv6 forwarding first
+        router.run("sysctl -w net.ipv6.conf.all.forwarding=1")
+        router.run("sysctl -w net.ipv6.conf.default.forwarding=1")
+        # Disable DAD globally to prevent address configuration delays/failures
+        router.run("sysctl -w net.ipv6.conf.all.accept_dad=0")
+        router.run("sysctl -w net.ipv6.conf.all.dad_transmits=0")
+        router.run("sysctl -w net.ipv6.conf.default.accept_dad=0")
+        router.run("sysctl -w net.ipv6.conf.default.dad_transmits=0")
+
+    # Load unified FRR configurations using integrated-vtysh-config
+    config_dir = os.path.join(CWD, ip_version)
+    common_config_dir = os.path.join(CWD, "common")
+    for rname, router in router_list.items():
+        config_path = os.path.join(config_dir, "{}/frr.conf".format(rname))
+        if not os.path.exists(config_path):
+            config_path = os.path.join(common_config_dir, "{}/frr.conf".format(rname))
+
+        logger.info(
+            "Loading unified %s config for %s from %s",
+            ip_version,
+            rname,
+            config_path,
+        )
+        # Enable mgmtd first (required for modern FRR)
+        router.load_config(TopoRouter.RD_MGMTD, "")
+        # Load unified frr.conf from the IP-version specific config directory
+        router.load_frr_config(config_path)
+
+        # Explicitly ensure pim6d and its configuration are applied for this
+        # topology when using IPv6 underlay. Guard this with a runtime check
+        # so tests don't crash on builds where pim6d is not compiled/enabled.
+        if ip_version == "ipv6" and rname in ["torm11", "torm12", "torm21", "torm22"]:
+            # Check for pim6d binary inside the router namespace; if missing,
+            # just log a warning and skip enabling/applying any pim6 config.
+            has_pim6d = (
+                router.run("test -x /usr/lib/frr/pim6d && echo yes || echo no")
+                .strip()
+                .endswith("yes")
+            )
+            if has_pim6d:
+                # Start pim6d with an empty config file (unified config will
+                # still drive most state).
+                router.load_config(TopoRouter.RD_PIM6, "")
+
+                # Program the PIMv6 configuration that used to live in the
+                # static frr.conf files only when pim6d is available.
+                #
+                # This includes:
+                # - router pim6
+                #     join-prune-interval 5
+                # - interface <uplinks> ipv6 pim
+                # - interface ipmr-lo ipv6 pim
+                uplinks = {
+                    "torm11": ["torm11-eth0", "torm11-eth1"],
+                    "torm12": ["torm12-eth0", "torm12-eth1"],
+                    "torm21": ["torm21-eth0", "torm21-eth1"],
+                    "torm22": ["torm22-eth0", "torm22-eth1"],
+                }
+
+                pim_cfg_cmds = [
+                    "configure terminal",
+                    "router pim6",
+                    " join-prune-interval 5",
+                ]
+                for intf in uplinks[rname]:
+                    pim_cfg_cmds.extend(
+                        [
+                            f"interface {intf}",
+                            " ipv6 pim",
+                        ]
+                    )
+
+                # ipmr-lo is created at the Linux level via config_mcast_tunnel_termination_device()
+                pim_cfg_cmds.extend(
+                    [
+                        "interface ipmr-lo",
+                        " ipv6 pim",
+                    ]
+                )
+                pim_cfg_cmds.append("end")
+
+                # Apply config via vtysh in the router namespace
+                router.vtysh_cmd("\n".join(pim_cfg_cmds))
+            else:
+                logger.warning(
+                    "pim6d binary not found on %s; skipping PIM6 daemon and config",
+                    rname,
+                )
+
+    # For all TORs we now manage addresses directly via Linux iproute2 in
+    # config_tor(), not via FRR interface configuration. Prevent startRouter()
+    # from flushing those kernel IPs, and for torm11 specifically, exercise
+    # config application via frr-reload.py instead of the default
+    # "vtysh -f /etc/frr/frr.conf" path in Router.startRouter.
+    torm11 = router_list.get("torm11")
+    for tor_name in tors:
+        tor = router_list.get(tor_name)
+        if tor is None:
+            continue
+        # `tor` is a TopoRouter wrapper; the actual FRR router object is
+        # `tor.net` (topotest.Router). Apply flags there so that
+        # Router.startRouter() sees them.
+        nrouter = tor.net
+        nrouter.skip_remove_ips = True
+        if tor_name == "torm11":
+            nrouter.skip_unified_vtysh = True
+
+    logger.info("Starting all routers...")
+    tgen.start_router()
+
+    # Give daemons a moment to stabilize
+    time.sleep(2)
+
+    # Verify all routers started successfully
+    logger.info("Verifying router daemons started...")
+    for rname, router in router_list.items():
+        status = router.check_router_running()
+        if status:
+            logger.error("Router %s has issues: %s", rname, status)
+            pytest.fail("Router {} failed to start properly: {}".format(rname, status))
+
+    # Explicitly exercise frr-reload on torm11 using the unified frr.conf.
+    # Run this inside the torm11 namespace so that vtysh talks to the correct daemons.
+    if torm11 is not None:
+        logger.info("Running frr-reload.py on torm11 unified config")
+        vtysh_path = torm11.run("command -v vtysh").strip()
+        if not vtysh_path:
+            pytest.fail("frr-reload requires vtysh, but it is not in torm11's PATH")
+        cmd = (
+            "/usr/lib/frr/frr-reload.py --bindir {} --reload /etc/frr/frr.conf".format(
+                os.path.dirname(vtysh_path)
+            )
+        )
+        # Run this inside the torm11 namespace (TopoRouter.net is the underlying node)
+        rc, out, err = torm11.net.cmd_status(cmd, warn=False)
+        if rc:
+            # Log full details and also surface them directly in the assertion
+            logger.error(
+                "frr-reload failed on torm11 (rc=%s): stdout=%s stderr=%s",
+                rc,
+                out,
+                err,
+            )
+            pytest.fail(
+                "frr-reload failed on torm11 (rc={})\nstdout:\n{}\nstderr:\n{}".format(
+                    rc, out, err
+                )
+            )
+
+        # Sanity check that all expected daemons on torm11 are still healthy
+        status = torm11.check_router_running()
+        if status:
+            logger.error("Router torm11 has issues after frr-reload: %s", status)
+            pytest.fail(
+                "Router torm11 failed health-check after frr-reload: {}".format(status)
+            )
+
+    # Configure hosts
+    hosts = ["hostd11", "hostd12", "hostd21", "hostd22"]
+    config_hosts(tgen, hosts)
+
+    # Disable DAD on all interfaces (additional per-interface configuration)
+    disable_dad_on_all_interfaces(tgen)
+
+    # Final underlay/BGP sanity check on torm11 for the selected AF.
+    if torm11 is not None:
+        if ip_version == "ipv6":
+            check_fn = partial(
+                check_underlay_and_bgp_ipv6,
+                torm11,
+                lo_prefix="2001:db8:100::15/128",
+                uplink_prefixes=tor_uplink_ipv6["torm11"],
+                neighbors=["2001:db8:1::1", "2001:db8:5::1"],
+            )
+        else:
+            check_fn = partial(
+                check_underlay_and_bgp_ipv4,
+                torm11,
+                lo_prefix="192.168.100.15/32",
+                uplink_prefixes=tor_uplink_ipv4["torm11"],
+                neighbors=["192.168.1.1", "192.168.5.1"],
+            )
+        _, result = topotest.run_and_expect(check_fn, None, count=20, wait=3)
+        assert result is None, "torm11 underlay/BGP sanity failed: %s" % (result,)
+
+    # Yield to tests
+    yield tgen, ip_version
+
+    # Teardown
+    tgen.stop_topology()
+
+
+def check_local_es(esi, vtep_ips, dut_name, down_vteps):
+    """
+    Compare a local ES VTEP list with this topology's rack peers.
+
+    A single VTEP, DF role, or kernel nexthop belongs in lib.evpn. This
+    helper stays here because it knows which ToRs share a rack.
+    """
+    peer_ips = []
+    if "torm1" in dut_name:
+        tor_ips_rack = tor_ips_rack_1
+    else:
+        tor_ips_rack = tor_ips_rack_2
+
+    for tor_name, tor_ip in tor_ips_rack.items():
+        if dut_name not in tor_name:
+            peer_ips.append(tor_ip)
+
+    # remove down VTEPs from the peer check list
+    peer_set = set(peer_ips)
+    down_vtep_set = set(down_vteps)
+    peer_set = peer_set - down_vtep_set
+
+    vtep_set = set(vtep_ips)
+    diff = peer_set.symmetric_difference(vtep_set)
+
+    return (esi, diff) if diff else None
+
+
+def check_remote_es(esi, vtep_ips, dut_name, down_vteps):
+    """
+    Verify list of PEs associated with a remote ES
+    """
+    remote_ips = []
+
+    if "torm1" in dut_name:
+        tor_ips_rack = tor_ips_rack_2
+    else:
+        tor_ips_rack = tor_ips_rack_1
+
+    for _, tor_ip in tor_ips_rack.items():
+        remote_ips.append(tor_ip)
+
+    # remove down VTEPs from the remote check list
+    remote_set = set(remote_ips)
+    down_vtep_set = set(down_vteps)
+    remote_set = remote_set - down_vtep_set
+
+    vtep_set = set(vtep_ips)
+    diff = remote_set.symmetric_difference(vtep_set)
+
+    return (esi, diff) if diff else None
+
+
+def check_es(dut):
+    """
+    Verify list of PEs associated all ESs, local and remote
+    """
+    bgp_es = dut.vtysh_cmd("show bgp l2vpn evpn es json")
+    bgp_es_json = json.loads(bgp_es)
+
+    result = None
+
+    expected_es_set = set([v for k, v in host_es_map.items()])
+    curr_es_set = []
+
+    # check is ES content is correct
+    for es in bgp_es_json:
+        esi = es["esi"]
+        curr_es_set.append(esi)
+        if not es.get("type", False):
+            return None
+        types = es["type"]
+        vtep_ips = []
+        for vtep in es.get("vteps", []):
+            vtep_ips.append(vtep["vtep_ip"])
+
+        if "local" in types:
+            result = check_local_es(esi, vtep_ips, dut.name, [])
+        else:
+            result = check_remote_es(esi, vtep_ips, dut.name, [])
+
+        if result:
+            return result
+
+    # check if all ESs are present
+    curr_es_set = set(curr_es_set)
+    result = curr_es_set.symmetric_difference(expected_es_set)
+
+    return result if result else None
+
+
+def check_one_es(dut, esi, down_vteps):
+    """
+    Verify list of PEs associated all ESs, local and remote
+    """
+    bgp_es = dut.vtysh_cmd("show bgp l2vpn evpn es %s json" % esi)
+    es = json.loads(bgp_es)
+
+    if not es:
+        return "esi %s not found" % esi
+
+    esi = es["esi"]
+    if not es.get("type", False):
+        return None
+    types = es["type"]
+    vtep_ips = []
+    for vtep in es.get("vteps", []):
+        vtep_ips.append(vtep["vtep_ip"])
+
+    if "local" in types:
+        result = check_local_es(esi, vtep_ips, dut.name, down_vteps)
+    else:
+        result = check_remote_es(esi, vtep_ips, dut.name, down_vteps)
+
+    return result
+
+
+def test_evpn_es(tgen_and_ip_version):
+    """
+    Two ES are setup on each rack. This test checks if -
+    1. ES peer has been added to the local ES (via Type-1/EAD route)
+    2. The remote ESs are setup with the right list of PEs (via Type-1)
+    """
+
+    tgen, ip_version = tgen_and_ip_version
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    dut_name = "torm11"
+    dut = tgen.gears[dut_name]
+    test_fn = partial(check_es, dut)
+    _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
+
+    assertmsg = '"{}" ES content incorrect. Result: {}'.format(dut_name, result)
+    assert result is None, assertmsg
+
+
+def test_evpn_ead_update(tgen_and_ip_version):
+    """
+    Flap a host link one the remote rack and check if the EAD updates
+    are sent/processed for the corresponding ESI
+    """
+    tgen, ip_version = tgen_and_ip_version
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    # dut on rack1 and host link flap on rack2
+    dut_name = "torm11"
+    dut = tgen.gears[dut_name]
+
+    remote_tor_name = "torm21"
+    remote_tor = tgen.gears[remote_tor_name]
+
+    host_name = "hostd21"
+    host = tgen.gears[host_name]
+    esi = host_es_map.get(host_name)
+
+    # check if the VTEP list is right to start with
+    down_vteps = []
+    test_fn = partial(check_one_es, dut, esi, down_vteps)
+    _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
+    assertmsg = '"{}" ES content incorrect'.format(dut_name)
+    assert result is None, assertmsg
+
+    # down a remote host link and check if the EAD withdraw is rxed
+    # Note: LACP is not working as expected so I am temporarily shutting
+    # down the link on the remote TOR instead of the remote host
+    shutdown_bringup_interface_in_kernel(
+        remote_tor.tgen,
+        remote_tor.name,
+        f"{remote_tor_name}-{'eth2'}",
+        False,
+    )
+    down_vteps.append(tor_ips.get(remote_tor_name))
+    _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
+    assertmsg = '"{}" ES incorrect after remote link down'.format(dut_name)
+    assert result is None, assertmsg
+
+    # bring up remote host link and check if the EAD update is rxed
+    down_vteps.remove(tor_ips.get(remote_tor_name))
+    shutdown_bringup_interface_in_kernel(
+        remote_tor.tgen,
+        remote_tor.name,
+        f"{remote_tor_name}-{'eth2'}",
+        True,
+    )
+    _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
+    assertmsg = '"{}" ES incorrect after remote link flap'.format(dut_name)
+    assert result is None, assertmsg
+
+
+def test_evpn_mh_peer_withdraw_during_bgpd_restart(tgen_and_ip_version):
+    """
+    A peer EAD withdrawal while bgpd is down must remove its ES VTEP in zebra.
+
+    zebra stays alive on torm12 while its bgpd is stopped. torm11 then withdraws
+    the Type-1/EAD for hostd11. Before the trigger, during the outage, and
+    after bgpd returns, bgpd, zebra, and the kernel FDB nexthop must agree on
+    that VTEP. The victim must finish as DF.
+    """
+    tgen, ip_version = tgen_and_ip_version
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    victim_name = "torm12"
+    peer_name = "torm11"
+    observer_name = "torm21"
+    victim = tgen.gears[victim_name]
+    peer = tgen.gears[peer_name]
+    observer = tgen.gears[observer_name]
+    esi = host_es_map["hostd11"]
+    peer_vtep = tor_ips[peer_name]
+    peer_access_link = "%s-eth2" % peer_name
+    bgpd_stopped = False
+    peer_link_down = False
+
+    try:
+        # Both daemons and the kernel must first agree that torm12's local ES
+        # still has its torm11 peer, and that torm12 is the non-DF.
+        for check in (
+            evpn_verify_bgp_es_vtep,
+            evpn_verify_zebra_es_vtep,
+            evpn_verify_es_kernel_nexthop,
+        ):
+            test_fn = partial(check, victim, esi, peer_vtep, True)
+            _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
+            assert result is None, "before bgpd stop: %s" % (result,)
+
+        test_fn = partial(evpn_verify_df_role, victim, esi, "nonDF")
+        _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
+        assert result is None, "before bgpd stop: %s" % (result,)
+
+        # Keep zebra running. Its BGP client-close cleanup is the behavior
+        # under test, so restarting zebra would discard the stale state.
+        kill_router_daemons(tgen, victim_name, ["bgpd"])
+        bgpd_stopped = True
+
+        # torm11 owns one half of hostd11's ES. Losing its access link withdraws
+        # that Type-1/EAD while torm12 cannot send REMOTE_ES_VTEP_DEL to zebra.
+        peer.run("ip link set dev %s down" % peer_access_link)
+        peer_link_down = True
+
+        # A live remote observer proves torm11's EAD withdrawal reached the
+        # EVPN fabric. The victim's bgpd is down, so its zebra and kernel are
+        # the producers that must already have dropped the VTEP.
+        test_fn = partial(evpn_verify_bgp_es_vtep, observer, esi, peer_vtep, False)
+        _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
+        assert result is None, "peer EAD withdrawal did not converge: %s" % (result,)
+
+        for check in (evpn_verify_zebra_es_vtep, evpn_verify_es_kernel_nexthop):
+            test_fn = partial(check, victim, esi, peer_vtep, False)
+            _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
+            assert result is None, "during bgpd stop: %s" % (result,)
+
+        test_fn = partial(evpn_verify_df_role, victim, esi, "DF")
+        _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
+        assert result is None, "during bgpd stop: %s" % (result,)
+
+        start_router_daemons(tgen, victim_name, ["bgpd"])
+        bgpd_stopped = False
+
+        # The new bgpd relearns the withdrawn EAD and must not put the VTEP
+        # back. zebra and the kernel must still agree, and the victim stays DF.
+        for check in (
+            evpn_verify_bgp_es_vtep,
+            evpn_verify_zebra_es_vtep,
+            evpn_verify_es_kernel_nexthop,
+        ):
+            test_fn = partial(check, victim, esi, peer_vtep, False)
+            _, result = topotest.run_and_expect(test_fn, None, count=30, wait=2)
+            assert result is None, "after bgpd restart: %s" % (result,)
+
+        test_fn = partial(evpn_verify_df_role, victim, esi, "DF")
+        _, result = topotest.run_and_expect(test_fn, None, count=30, wait=2)
+        assert result is None, "after bgpd restart: %s" % (result,)
+    finally:
+        # Restore both daemons and the access link even when the stale-VTEP
+        # assertion fails, so later tests start from the original topology.
+        if bgpd_stopped:
+            start_router_daemons(tgen, victim_name, ["bgpd"])
+        if peer_link_down:
+            peer.run("ip link set dev %s up" % peer_access_link)
+
+
+def ping_anycast_gw(tgen):
+    # ping the anycast gw from the local and remote hosts to populate
+    # the mac address on the PEs
+    intf = "torbond"
+    ipaddr = "2001:db8:45::1"
+    cmd_tmpl = "ping6 -I {} -c 1 {}"
+    if active_ip_version == "ipv4":
+        ipaddr = "45.0.0.1"
+        cmd_tmpl = "ping -I {} -c 1 {}"
+    for name in ("hostd11", "hostd21", "hostd12", "hostd22"):
+        host = tgen.net.hosts[name]
+        ping_cmd = cmd_tmpl.format(intf, ipaddr)
+        _, stdout, _ = host.cmd_status(ping_cmd, warn=False, stderr=subprocess.STDOUT)
+        stdout = stdout.strip()
+        if stdout:
+            host.logger.debug(
+                "%s: ping6 on %s for %s returned: %s", name, intf, ipaddr, stdout
+            )
+
+
+def check_mac(dut, vni, mac, m_type, esi, intf, ping_gw=False, tgen=None):
+    """Refresh host MACs when asked, then use the shared MH MAC check."""
+    if ping_gw:
+        ping_anycast_gw(tgen)
+    return evpn_verify_mh_mac(dut, vni, mac, m_type, esi, intf)
+
+
+def test_evpn_mac(tgen_and_ip_version):
+    """
+    1. Add a MAC on hostd11 and check if the MAC is synced between
+    torm11 and torm12. And installed as a local MAC.
+    2. Add a MAC on hostd21 and check if the MAC is installed as a
+    remote MAC on torm11 and torm12
+    """
+
+    tgen, ip_version = tgen_and_ip_version
+
+    local_host = tgen.gears["hostd11"]
+    remote_host = tgen.gears["hostd21"]
+    tors = []
+    tors.append(tgen.gears["torm11"])
+    tors.append(tgen.gears["torm12"])
+
+    vni = 1000
+
+    # check if the rack-1 host MAC is present on all rack-1 PEs
+    # and points to local access port
+    m_type = "local"
+    _, mac = compute_host_ip_mac(local_host.name)
+    esi = host_es_map.get(local_host.name)
+    intf = "hostbond1"
+
+    for tor in tors:
+        test_fn = partial(check_mac, tor, vni, mac, m_type, esi, intf, True, tgen)
+        _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
+        assertmsg = '"{}" local MAC content incorrect'.format(tor.name)
+        assert result is None, assertmsg
+
+    # check if the rack-2 host MAC is present on all rack-1 PEs
+    # and points to the remote ES destination
+    m_type = "remote"
+    _, mac = compute_host_ip_mac(remote_host.name)
+    esi = host_es_map.get(remote_host.name)
+    intf = ""
+
+    for tor in tors:
+        test_fn = partial(check_mac, tor, vni, mac, m_type, esi, intf)
+        _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
+        assertmsg = '"{}" remote MAC content incorrect'.format(tor.name)
+        assert result is None, assertmsg
+
+
+def test_evpn_df(tgen_and_ip_version):
+    """
+    1. Check the DF role on all the PEs on rack-1.
+    2. Increase the DF preference on the non-DF and check if it becomes
+       the DF winner.
+    """
+
+    tgen, ip_version = tgen_and_ip_version
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    # We will run the tests on just one ES
+    esi = host_es_map.get("hostd11")
+    intf = "hostbond1"
+
+    tors = []
+    tors.append(tgen.gears["torm11"])
+    tors.append(tgen.gears["torm12"])
+    df_node = "torm11"
+
+    # check roles on rack-1
+    for tor in tors:
+        role = "DF" if tor.name == df_node else "nonDF"
+        test_fn = partial(evpn_verify_df_role, tor, esi, role)
+        _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
+        assertmsg = '"{}" DF role incorrect'.format(tor.name)
+        assert result is None, assertmsg
+
+    # change df preference on the nonDF to make it the df
+    torm12 = tgen.gears["torm12"]
+    torm12.vtysh_cmd("conf\ninterface %s\nevpn mh es-df-pref %d" % (intf, 60000))
+    df_node = "torm12"
+
+    # re-check roles on rack-1; we should have a new winner
+    for tor in tors:
+        role = "DF" if tor.name == df_node else "nonDF"
+        test_fn = partial(evpn_verify_df_role, tor, esi, role)
+        _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
+        assertmsg = '"{}" DF role incorrect'.format(tor.name)
+        assert result is None, assertmsg
+
+
+def test_evpn_uplink_tracking(tgen_and_ip_version):
+    """
+    1. Wait for access ports to come out of startup-delay
+    2. disable uplinks and check if access ports have been protodowned
+    3. enable uplinks and check if access ports have been moved out
+       of protodown
+    """
+
+    tgen, ip_version = tgen_and_ip_version
+
+    dut_name = "torm11"
+    dut = tgen.gears[dut_name]
+
+    # wait for protodown rc to clear after startup
+    test_fn = partial(evpn_verify_protodown_reason, dut, None)
+    _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
+    assertmsg = '"{}" protodown rc incorrect'.format(dut_name)
+    assert result is None, assertmsg
+
+    # disable the uplinks
+    shutdown_bringup_interface_in_kernel(dut.tgen, dut.name, f"{dut_name}-eth0", False)
+    shutdown_bringup_interface_in_kernel(dut.tgen, dut.name, f"{dut_name}-eth1", False)
+
+    # check if the access ports have been protodowned
+    test_fn = partial(evpn_verify_protodown_reason, dut, "uplinkDown")
+    _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
+    assertmsg = '"{}" protodown rc incorrect'.format(dut_name)
+    assert result is None, assertmsg
+
+    # enable the uplinks
+    shutdown_bringup_interface_in_kernel(dut.tgen, dut.name, f"{dut_name}-eth0", True)
+    shutdown_bringup_interface_in_kernel(dut.tgen, dut.name, f"{dut_name}-eth1", True)
+
+    # check if the access ports have been moved out of protodown
+    test_fn = partial(evpn_verify_protodown_reason, dut, None)
+    _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
+    assertmsg = '"{}" protodown rc incorrect'.format(dut_name)
+    assert result is None, assertmsg
+
+    # The uplink flap reset the BGP sessions, which withdrew every ES on the
+    # DUT. Protodown clears as soon as the links are up, long before the ESs
+    # are back, so wait for them here. Otherwise the next test starts from a
+    # half-built network and fails on a race this test caused.
+    test_fn = partial(check_es, dut)
+    _, result = topotest.run_and_expect(test_fn, None, count=30, wait=3)
+    assertmsg = '"{}" ES content incorrect after uplink restore. Result: {}'.format(
+        dut_name, result
+    )
+    assert result is None, assertmsg
+
+
+#####################################################
+##
+##   Remote MAC moves from a single VTEP to an ES (EVPN MH)
+##
+## A remote MAC is first learnt with no ESI, so zebra programs it in the
+## kernel as "dst <vtep>". The same MAC is then re-advertised with an ESI, and
+## must be programmed as "nhid <ES nexthop group>". The kernel cannot replace
+## a "dst" FDB entry with an "nhid" one, so zebra has to delete the old entry
+## first. That delete used to be skipped when the ES nexthop group was not yet
+## active, leaving the single-VTEP entry in place and every later nhid install
+## failing with:
+##     Cannot replace an existing non nexthop fdb with a nexthop
+##
+## Roles (all names from the topology above):
+##   torm11  observer: the remote MAC and ES are seen here
+##   torm21  the leaf that learns the MAC, first on a plain access port
+##           (no ES), then on hostbond1 (ES of hostd21)
+##   torm22  the other leaf of the ES; syncs the MAC from torm21
+##
+## torm22 is checked around the same move. Before it, the MAC is remote there
+## with dst <torm21>. After the sync it is local on hostbond1 for that ES, and
+## the vxlan "self" entry for the old VTEP is gone. That is the sync-delete
+## path; the observer checks above do not reach it.
+##
+## The move is a bridge fdb replace of the existing entry onto hostbond1.
+## BGP updates the same Type-2 with the ESI, and the observer still has the
+## dst entry when that update arrives.
+##
+## The two conditions needed to trigger the old behaviour are:
+##   (a) the observer holds the MAC as a non-ES remote MAC, and
+##   (b) the ES nexthop group is inactive on the observer when the Type-2
+##       with the ESI arrives. This is forced by an inbound route-map on the
+##       observer that drops EVPN Type-1 (EAD) routes: with no EAD the ES has
+##       no VTEPs, so zebra cannot activate its nexthop group.
+## test_evpn_mac_move_to_es_nhg_inactive covers (a)+(b); the _nhg_active test
+## is the control with only (a).
+##
+## Every stage is logged from BGP, zebra and the kernel; see
+## evpn_mac_snapshot() in lib/evpn.py. Everything the test creates is removed
+## in a finally block and then verified to be gone.
+#####################################################
+
+MOVE_VNI = 1000
+MOVE_MAC = "02:00:5e:53:74:02"  # locally administered, not used by any host
+MOVE_ES_HOST = "hostd21"  # its ES (host_es_map) is the one the MAC moves to
+MOVE_OBSERVER = "torm11"
+MOVE_LEARN_LEAF = "torm21"
+MOVE_PEER_LEAF = "torm22"
+MOVE_ACCESS_PORT = "shport0"  # dummy access port: a MAC behind it has no ESI
+MOVE_ES_PORT = "hostbond1"  # ES bond of hostd21 on both remote leaves
+MOVE_ROUTE_MAP = "MAC_MOVE_HOLD_EAD"
+# ES peers keep a synced MAC for the hold time after the active leaf drops it;
+# the default (1080s) is far longer than the test cleanup may wait.
+MOVE_MAC_HOLDTIME = 10
+# bridge ageing_time is in centiseconds; the topology default is 18s, which
+# would age the injected MAC out mid-test.
+MOVE_AGEING_CS = 100000
+MOVE_KERNEL_ERR = "Cannot replace an existing non nexthop fdb with a nexthop"
+
+# Ubuntu 7.0 builds that reject a dynamic VXLAN FDB entry pointing at a
+# nexthop id (stable c8f29af91e08, upstream 98fc57d16744). FRR installs an
+# EVPN-MH remote MAC that way, so stage 4 cannot pass on these kernels.
+# The correction is 7308ef8b4a67 ("vxlan: Stop rejecting dynamic FDB
+# entries with a nexthop ID"). It is not in an Ubuntu build yet: `fixed`
+# stays None, and every ABI at or above `broken` is skipped. Set `fixed`
+# to the first ABI whose changelog contains that commit and newer builds
+# run again. generic 7.0.0-39 and azure 7.0.0-1018 do not have the reject;
+# generic 7.0.0-41 and azure 7.0.0-1019 are the first that do. The AWS
+# 7.0.0-1016 runner also rejects the entry. 7.0.0-42 and 7.0.0-43 still do
+# not have the correction. version_cmp() drops the ABI after the hyphen, so
+# this parser reads it itself.
+_UBUNTU_KERNEL_RE = re.compile(
+    r"^(?P<version>\d+\.\d+\.\d+)-(?P<abi>\d+)-(?P<flavor>[A-Za-z0-9_-]+)$"
+)
+_VXLAN_NH_FDB_FIX = {
+    "7.0.0": {
+        "aws": (1016, None),
+        "azure": (1019, None),
+        "generic": (41, None),
+    },
+    "7.2.15": {
+        "generic": (1, None),
+    },
+}
+MOVE_DEBUGS = [
+    "debug zebra kernel",
+    "debug zebra evpn mh mac",
+    "debug zebra evpn mh es",
+    "debug zebra vxlan",
+]
+
+
+#
+# Level 1: single actions. Each does one thing and logs it.
+#
+
+
+def move_bridge_ageing_cs(router):
+    """Current br_default ageing_time (centiseconds)."""
+    out = router.run("ip -d link show dev br_default")
+    match = re.search(r"ageing_time (\d+)", out)
+    assert match, "%s: cannot read br_default ageing_time: %s" % (router.name, out)
+    return int(match.group(1))
+
+
+def move_zebra_log_mark(router):
+    """Offset into zebra.log, to read only what the test event caused."""
+    try:
+        return len(router.net.getLog("log", "zebra"))
+    except OSError:
+        return None
+
+
+def move_zebra_log_since(router, mark):
+    """zebra.log text after `mark` ('' when the log file is not readable)."""
+    if mark is None:
+        return ""
+    try:
+        return router.net.getLog("log", "zebra")[mark:]
+    except OSError:
+        return ""
+
+
+def move_fdb_dump(router, esi, mac, log_mark):
+    """
+    Kernel and zebra state for `mac` on `router`, for a failed assertion.
+    The ES nexthop group id is read from zebra now, since it differs per run.
+    """
+    lines = ["bridge fdb entries for %s:" % mac]
+    lines.append(
+        str(router.run("bridge -d fdb show | grep -i -F -- %s || true" % mac)).strip()
+    )
+    es = evpn_lib.evpn_zebra_es_state(router, esi)
+    nhg_id = es.get("nhg_id") or 0
+    lines.append("zebra ES %s: nexthopGroup %s" % (esi, nhg_id))
+    if nhg_id:
+        lines.append("ip nexthop get id %s:" % nhg_id)
+        lines.append(
+            str(router.run("ip nexthop get id %d 2>&1 || true" % nhg_id)).strip()
+        )
+    zebra_lines = [
+        line
+        for line in move_zebra_log_since(router, log_mark).splitlines()
+        if mac.lower() in line.lower() or MOVE_KERNEL_ERR in line or "Extended" in line
+    ]
+    lines.append("zebra log (last 40 matching lines):")
+    lines.extend(zebra_lines[-40:])
+    return "\n".join(lines)
+
+
+def move_hold_ead(router, hold):
+    """
+    Drop (hold=True) or accept (hold=False) EVPN Type-1 routes from every EVPN
+    peer of `router`, and re-run the inbound policy.
+    """
+    summary = router.vtysh_cmd("show bgp l2vpn evpn summary json", isjson=True)
+    summary = summary.get("l2VpnEvpn", summary)
+    asn = summary.get("as")
+    peers = list(summary.get("peers", {}).keys())
+    assert asn and peers, "%s: no EVPN peers: %s" % (router.name, summary)
+
+    cmds = ["configure terminal"]
+    if hold:
+        cmds += [
+            "route-map %s deny 10" % MOVE_ROUTE_MAP,
+            " match evpn route-type ead",
+            "exit",
+            "route-map %s permit 20" % MOVE_ROUTE_MAP,
+            "exit",
+        ]
+    cmds += ["router bgp %s" % asn, " address-family l2vpn evpn"]
+    for peer in peers:
+        cmds.append(
+            "  %sneighbor %s route-map %s in"
+            % ("" if hold else "no ", peer, MOVE_ROUTE_MAP)
+        )
+    cmds += [" exit-address-family", "exit"]
+    if not hold:
+        cmds.append("no route-map %s" % MOVE_ROUTE_MAP)
+    cmds.append("end")
+    router.vtysh_cmd("\n".join(cmds))
+    router.vtysh_cmd("clear bgp l2vpn evpn * soft in")
+    logger.info("%s: Type-1 routes %s", router.name, "held" if hold else "released")
+
+
+def move_add_access_port(leaf):
+    """Add a dummy bridge port in the MAC's VLAN. A MAC behind it has no ES."""
+    for cmd in (
+        "ip link add dev %s type dummy" % MOVE_ACCESS_PORT,
+        "ip link set dev %s master br_default" % MOVE_ACCESS_PORT,
+        "bridge vlan del vid 1 dev %s" % MOVE_ACCESS_PORT,
+        "bridge vlan add vid %d pvid untagged dev %s" % (MOVE_VNI, MOVE_ACCESS_PORT),
+        "ip link set dev %s up" % MOVE_ACCESS_PORT,
+    ):
+        leaf.run(cmd)
+
+
+def replace_mac_on_port(leaf, port):
+    """Replace MOVE_MAC onto `port` as a dynamic bridge entry."""
+    leaf.run(
+        "bridge fdb replace %s dev %s vlan %d master dynamic"
+        % (MOVE_MAC, port, MOVE_VNI)
+    )
+    logger.info("%s: MAC %s replaced onto %s", leaf.name, MOVE_MAC, port)
+
+
+def delete_mac_from_port(leaf, port):
+    """Delete MOVE_MAC from `port`. A missing entry is not an error."""
+    leaf.run(
+        "bridge fdb del %s dev %s vlan %d master 2>/dev/null || true"
+        % (MOVE_MAC, port, MOVE_VNI)
+    )
+
+
+#
+# Level 2: baseline, setup and cleanup of everything the test touches, with the
+# original values kept so the cleanup can be verified against them.
+#
+
+
+def move_baseline(tgen):
+    """
+    Wait for the ES to be fully known on the observer, then record the state
+    the cleanup must restore and check the MAC is nowhere. Changes nothing.
+    """
+    obs = tgen.gears[MOVE_OBSERVER]
+    leaves = [tgen.gears[MOVE_LEARN_LEAF], tgen.gears[MOVE_PEER_LEAF]]
+    esi = host_es_map[MOVE_ES_HOST]
+    expected_vteps = sorted(tor_ips[n] for n in (MOVE_LEARN_LEAF, MOVE_PEER_LEAF))
+
+    # Wait for the ES instead of reading it once. zebra frees a remote ES when
+    # its EAD and MAC routes are withdrawn and rebuilds it only after bgpd
+    # re-advertises them, so a session reset leaves a window where
+    # "show evpn es" is empty. The same check proves the NHG is active, which
+    # the nhg_active control case relies on from its first stage.
+    _, result = topotest.run_and_expect(
+        partial(check_move_es_nhg_active, obs, esi, expected_vteps),
+        None,
+        count=30,
+        wait=3,
+    )
+    assert result is None, "baseline: %s" % result
+
+    saved = {
+        "esi": esi,
+        "ageing": {l.name: move_bridge_ageing_cs(l) for l in leaves},
+        "holdtime": {
+            l.name: l.vtysh_cmd("show evpn json", isjson=True).get("macHoldtime")
+            for l in leaves
+        },
+        # torm22 is where a remote MAC becomes local on the ES. Its zebra
+        # log is the one that shows whether the old dst entry is deleted.
+        "debugging": {
+            r.name: r.vtysh_cmd("show debugging")
+            for r in (obs, tgen.gears[MOVE_PEER_LEAF])
+        },
+        "obs_es_vteps": evpn_lib.evpn_zebra_es_state(obs, esi)["vteps"],
+    }
+
+    for router in [obs] + leaves:
+        result = evpn_lib.evpn_check_mac_absent(router, MOVE_VNI, MOVE_MAC)
+        assert result is None, "baseline: %s" % result
+    return saved
+
+
+def move_set_debugs(routers, on):
+    """Enable or disable MOVE_DEBUGS on each router."""
+    verb = "" if on else "no "
+    cmds = ["configure terminal"] + [verb + d for d in MOVE_DEBUGS] + ["end"]
+    for router in routers:
+        router.vtysh_cmd("\n".join(cmds))
+
+
+def move_configure(tgen):
+    """Apply the test-only configuration. move_cleanup() reverts all of it."""
+    obs = tgen.gears[MOVE_OBSERVER]
+    for name in (MOVE_LEARN_LEAF, MOVE_PEER_LEAF):
+        leaf = tgen.gears[name]
+        leaf.run(
+            "ip link set dev br_default type bridge ageing_time %d" % MOVE_AGEING_CS
+        )
+        leaf.vtysh_cmd(
+            "configure terminal\nevpn mh mac-holdtime %d" % MOVE_MAC_HOLDTIME
+        )
+    move_add_access_port(tgen.gears[MOVE_LEARN_LEAF])
+    move_set_debugs((obs, tgen.gears[MOVE_PEER_LEAF]), True)
+
+
+def move_cleanup(tgen, saved):
+    """Undo move_setup() and everything the test did. Safe to call twice."""
+    obs = tgen.gears[MOVE_OBSERVER]
+    leaves = [tgen.gears[MOVE_LEARN_LEAF], tgen.gears[MOVE_PEER_LEAF]]
+
+    move_hold_ead(obs, False)
+    for leaf in leaves:
+        # the MAC may sit on the dummy port, the ES bond, or both (synced)
+        delete_mac_from_port(leaf, MOVE_ACCESS_PORT)
+        delete_mac_from_port(leaf, MOVE_ES_PORT)
+    tgen.gears[MOVE_LEARN_LEAF].run(
+        "ip link del dev %s 2>/dev/null || true" % MOVE_ACCESS_PORT
+    )
+    for leaf in leaves:
+        leaf.run(
+            "ip link set dev br_default type bridge ageing_time %d"
+            % saved["ageing"][leaf.name]
+        )
+    # mac-holdtime stays at MOVE_MAC_HOLDTIME until the MAC is gone.
+    # zebra reads it when the sync hold timer is armed, which is after this
+    # function returns (the FDB delete is still in the netlink queue). Restoring
+    # the default here arms that timer for 1080s.
+    move_set_debugs((obs, tgen.gears[MOVE_PEER_LEAF]), False)
+
+
+def move_restore_holdtime(tgen):
+    """Put mac-holdtime back to the default. The sync hold must already have ended."""
+    for name in (MOVE_LEARN_LEAF, MOVE_PEER_LEAF):
+        tgen.gears[name].vtysh_cmd(
+            "configure terminal\nno evpn mh mac-holdtime %d" % MOVE_MAC_HOLDTIME
+        )
+
+
+def check_move_mac_gone(tgen):
+    """None when MOVE_MAC is gone from zebra, the kernel and BGP on every router."""
+    for name in (MOVE_OBSERVER, MOVE_LEARN_LEAF, MOVE_PEER_LEAF):
+        result = evpn_lib.evpn_check_mac_absent(tgen.gears[name], MOVE_VNI, MOVE_MAC)
+        if result:
+            return result
+    return None
+
+
+def check_move_residual(tgen, saved):
+    """
+    None when nothing of the test is left: MAC gone from every router and
+    layer, the dummy port and route-map removed, ageing/hold-time/debug
+    settings back to their original values, and the ES as it was found.
+    """
+    obs = tgen.gears[MOVE_OBSERVER]
+    leaves = [tgen.gears[MOVE_LEARN_LEAF], tgen.gears[MOVE_PEER_LEAF]]
+    esi = saved["esi"]
+
+    result = check_move_mac_gone(tgen)
+    if result:
+        return result
+    for leaf in leaves:
+        # the access-side bridge FDB (local entries, synced entries)
+        left = leaf.run("bridge fdb show | grep -i -F %s || true" % MOVE_MAC).strip()
+        if left:
+            return "%s: bridge FDB still has %s: %s" % (leaf.name, MOVE_MAC, left)
+        now = move_bridge_ageing_cs(leaf)
+        if now != saved["ageing"][leaf.name]:
+            return "%s: ageing_time %d, expected %d" % (
+                leaf.name,
+                now,
+                saved["ageing"][leaf.name],
+            )
+        holdtime = leaf.vtysh_cmd("show evpn json", isjson=True).get("macHoldtime")
+        if holdtime != saved["holdtime"][leaf.name]:
+            return "%s: mac-holdtime %s, expected %s" % (
+                leaf.name,
+                holdtime,
+                saved["holdtime"][leaf.name],
+            )
+    if "does not exist" not in tgen.gears[MOVE_LEARN_LEAF].run(
+        "ip link show dev %s 2>&1" % MOVE_ACCESS_PORT
+    ):
+        return "%s: %s still exists" % (MOVE_LEARN_LEAF, MOVE_ACCESS_PORT)
+
+    if MOVE_ROUTE_MAP in obs.vtysh_cmd("show running-config"):
+        return "%s: route-map %s still configured" % (obs.name, MOVE_ROUTE_MAP)
+    for name, before in saved["debugging"].items():
+        now = tgen.gears[name].vtysh_cmd("show debugging")
+        if now != before:
+            return "%s: debug settings differ from before the test" % name
+
+    es = evpn_lib.evpn_zebra_es_state(obs, esi)
+    if es["vteps"] != saved["obs_es_vteps"] or not es["nhg_active"]:
+        return "%s: ES %s not restored (zebra %s)" % (obs.name, esi, es)
+    bgp_vteps = evpn_lib.evpn_bgp_es_vteps(obs, esi)
+    if bgp_vteps != saved["obs_es_vteps"]:
+        return "%s: ES %s BGP VTEPs %s, expected %s" % (
+            obs.name,
+            esi,
+            bgp_vteps,
+            saved["obs_es_vteps"],
+        )
+    return None
+
+
+#
+# Level 3: per-stage expectations, polled until true. Each returns None on
+# success or a message naming the layer that does not match yet.
+#
+
+
+def check_move_peer_local(peer, vni, mac, esi, intf):
+    """
+    None when `peer` holds `mac` as a synced local MAC on `intf` for `esi`.
+
+    The old single-VTEP vxlan "self" entry must be gone. The bridge "master"
+    entry on the ES port is local forwarding state and is not this entry.
+    """
+    entry = evpn_lib.evpn_zebra_mac_entry(peer, vni, mac)
+    if (
+        not entry
+        or entry.get("type") != "local"
+        or entry.get("esi") != esi
+        or entry.get("intf") != intf
+        or not entry.get("peerActive")
+        or not entry.get("localInactive")
+    ):
+        return "%s: zebra MAC %s is not a synced local MAC on %s ES %s: %s" % (
+            peer.name,
+            mac,
+            intf,
+            esi,
+            entry,
+        )
+    fdb = evpn_lib.evpn_kernel_vxlan_fdb_entry(peer, mac, vni)
+    if fdb:
+        return "%s: vxlan FDB still has a remote entry for %s: %s" % (
+            peer.name,
+            mac,
+            fdb,
+        )
+    return None
+
+
+def check_move_es_nhg_inactive(obs, esi):
+    """No VTEP in bgpd or zebra for the ES, so zebra's NHG cannot be active."""
+    bgp_vteps = evpn_lib.evpn_bgp_es_vteps(obs, esi)
+    es = evpn_lib.evpn_zebra_es_state(obs, esi)
+    if bgp_vteps or es["vteps"] or es["nhg_active"]:
+        return "ES %s still active on %s: bgp vteps %s, zebra %s" % (
+            esi,
+            obs.name,
+            bgp_vteps,
+            es,
+        )
+    return None
+
+
+def check_move_es_nhg_active(obs, esi, vteps):
+    """The ES lists all its VTEPs in bgpd and zebra and its NHG is active."""
+    # bgpd's view: reuse check_one_es(), which compares the ES's VTEPs with the
+    # remote rack's TORs (all of them, as none is down).
+    result = check_one_es(obs, esi, [])
+    if result:
+        return "bgp ES %s on %s not complete yet: %s" % (esi, obs.name, result)
+    es = evpn_lib.evpn_zebra_es_state(obs, esi)
+    if es["vteps"] != vteps or not es["nhg_active"]:
+        return "zebra ES %s on %s not active yet: %s, expected VTEPs %s" % (
+            esi,
+            obs.name,
+            es,
+            vteps,
+        )
+    return None
+
+
+#
+# Level 4: the scenario.
+#
+
+
+def _ubuntu_kernel_family(flavor):
+    """Map a uname flavor onto the ABI series that carries the vxlan reject."""
+    if flavor == "azure" or flavor.startswith("azure-"):
+        return "azure"
+    if flavor == "aws" or flavor.startswith("aws-"):
+        return "aws"
+    if flavor == "generic" or flavor.startswith("generic-") or flavor == "lowlatency":
+        return "generic"
+    return None
+
+
+def vxlan_dynamic_nh_fdb_skip_reason(release=None):
+    """
+    Why to skip the MAC-move checks on this kernel, or None to run them.
+
+    Kernels older than the reject still run. Kernels at or after `fixed`
+    run again. While `fixed` is None the skip covers the whole broken range.
+    """
+    if release is None:
+        release = platform.release()
+    logger.debug("vxlan nh fdb: release %s", release)
+    match = _UBUNTU_KERNEL_RE.match(release)
+    if match is None:
+        logger.debug("vxlan nh fdb: %s is not an Ubuntu ABI kernel, running", release)
+        return None
+    version = match.group("version")
+    flavor = match.group("flavor")
+    family = _ubuntu_kernel_family(flavor)
+    abi = int(match.group("abi"))
+    window = _VXLAN_NH_FDB_FIX.get(version, {}).get(family)
+    logger.debug(
+        "vxlan nh fdb: version %s abi %s flavor %s family %s window %s",
+        version,
+        abi,
+        flavor,
+        family,
+        window,
+    )
+    if window is None:
+        logger.debug(
+            "vxlan nh fdb: no window for %s family %s, running", version, family
+        )
+        return None
+    broken, fixed = window
+    if abi < broken:
+        logger.debug("vxlan nh fdb: abi %s is before broken %s, running", abi, broken)
+        return None
+    if fixed is not None and abi >= fixed:
+        logger.debug(
+            "vxlan nh fdb: abi %s is at or after fixed %s, running", abi, fixed
+        )
+        return None
+    if fixed is None:
+        resume = "the first Ubuntu build that contains 7308ef8b4a67"
+    else:
+        resume = "%s-%s-%s" % (version, fixed, flavor)
+    logger.debug(
+        "vxlan nh fdb: skip abi %s, broken from %s, fixed at %s", abi, broken, fixed
+    )
+    return (
+        "kernel %s rejects a dynamic VXLAN FDB entry with a nexthop id "
+        "(c8f29af91e08); EVPN-MH nhid install resumes on %s" % (release, resume)
+    )
+
+
+def run_mac_move_case(tgen, hold_ead):
+    """
+    Move MOVE_MAC from a single-VTEP remote MAC to an ES MAC on the observer.
+
+    hold_ead=True  the ES nexthop group is inactive when the ESI arrives
+    hold_ead=False the ES nexthop group is active throughout (control)
+    """
+    obs = tgen.gears[MOVE_OBSERVER]
+    learn_leaf = tgen.gears[MOVE_LEARN_LEAF]
+    peer = tgen.gears[MOVE_PEER_LEAF]
+    esi = host_es_map[MOVE_ES_HOST]
+    learn_vtep = tor_ips[MOVE_LEARN_LEAF]
+    es_vteps = sorted(tor_ips[n] for n in (MOVE_LEARN_LEAF, MOVE_PEER_LEAF))
+
+    saved = move_baseline(tgen)
+    log_mark = move_zebra_log_mark(obs)
+    peer_log_mark = move_zebra_log_mark(tgen.gears[MOVE_PEER_LEAF])
+    try:
+        move_configure(tgen)
+        # ---- stage 1: set the ES NHG state the case needs --------------
+        if hold_ead:
+            move_hold_ead(obs, True)
+            _, result = topotest.run_and_expect(
+                partial(check_move_es_nhg_inactive, obs, esi), None, count=20, wait=3
+            )
+            assert result is None, "stage 1 (hold EAD): %s" % result
+        evpn_lib.evpn_mac_snapshot(obs, MOVE_MAC, MOVE_VNI, esi)
+
+        # ---- stage 2: MAC learnt with no ESI ---------------------------
+        replace_mac_on_port(learn_leaf, MOVE_ACCESS_PORT)
+        test_fn = partial(
+            evpn_lib.evpn_check_remote_mac_vtep, obs, MOVE_VNI, MOVE_MAC, learn_vtep
+        )
+        _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
+        evpn_lib.evpn_mac_snapshot(obs, MOVE_MAC, MOVE_VNI, esi)
+        assert result is None, "stage 2 (non-ES MAC): %s" % result
+        # The ES peer must hold the same non-ES MAC before the move. The
+        # sync-delete only runs when that remote VTEP entry exists.
+        test_fn = partial(
+            evpn_lib.evpn_check_remote_mac_vtep, peer, MOVE_VNI, MOVE_MAC, learn_vtep
+        )
+        _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
+        evpn_lib.evpn_mac_snapshot(peer, MOVE_MAC, MOVE_VNI, esi)
+        assert result is None, "stage 2 (peer non-ES MAC): %s" % result
+
+        # ---- stage 3: same MAC now behind the ES -----------------------
+        # Replace the bridge entry onto the ES port. The Type-2 is updated
+        # in place (ESI added) while the observer still holds the dst entry.
+        replace_mac_on_port(learn_leaf, MOVE_ES_PORT)
+        # NHG inactive: zebra cannot program the nhid yet, and must not leave
+        # the old "dst" entry behind. NHG active: programmed straight away.
+        test_fn = partial(
+            evpn_lib.evpn_check_remote_mac_es,
+            obs,
+            MOVE_VNI,
+            MOVE_MAC,
+            esi,
+            not hold_ead,
+        )
+        _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
+        evpn_lib.evpn_mac_snapshot(obs, MOVE_MAC, MOVE_VNI, esi)
+        assert result is None, "stage 3 (move to ES, NHG %s): %s" % (
+            "inactive" if hold_ead else "active",
+            result,
+        )
+        # Synced onto the peer: local on the ES bond, old dst entry deleted.
+        test_fn = partial(
+            check_move_peer_local, peer, MOVE_VNI, MOVE_MAC, esi, MOVE_ES_PORT
+        )
+        _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
+        evpn_lib.evpn_mac_snapshot(peer, MOVE_MAC, MOVE_VNI, esi)
+        assert result is None, "stage 3 (peer local on ES): %s" % result
+
+        # ---- stage 4: ES NHG becomes active ----------------------------
+        if hold_ead:
+            move_hold_ead(obs, False)
+            test_fn = partial(check_move_es_nhg_active, obs, esi, es_vteps)
+            _, result = topotest.run_and_expect(test_fn, None, count=30, wait=3)
+            assert result is None, "stage 4 (release EAD): %s" % result
+            test_fn = partial(
+                evpn_lib.evpn_check_remote_mac_es, obs, MOVE_VNI, MOVE_MAC, esi, True
+            )
+            _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
+            evpn_lib.evpn_mac_snapshot(obs, MOVE_MAC, MOVE_VNI, esi)
+            assert result is None, "stage 4 (NHG active): %s\n%s" % (
+                result,
+                move_fdb_dump(obs, esi, MOVE_MAC, log_mark),
+            )
+
+        # ---- the kernel must not have rejected anything ----------------
+        zebra_log = move_zebra_log_since(obs, log_mark)
+        rejected = [l for l in zebra_log.splitlines() if MOVE_KERNEL_ERR in l]
+        assert not rejected, "kernel rejected the nhid install %d time(s):\n%s" % (
+            len(rejected),
+            "\n".join(rejected[:5]),
+        )
+    finally:
+        # Debug aid: the MAC's lines from zebra.log, whether or not we passed.
+        # torm22 is read before move_cleanup() turns its debug off.
+        for router, mark in (
+            (obs, log_mark),
+            (tgen.gears[MOVE_PEER_LEAF], peer_log_mark),
+        ):
+            for line in move_zebra_log_since(router, mark).splitlines():
+                if (
+                    MOVE_MAC in line
+                    or MOVE_KERNEL_ERR in line
+                    or "uninstall skipped" in line
+                    or "removing the vxlan entry" in line
+                ):
+                    logger.debug("%s zebra: %s", router.name, line)
+        move_cleanup(tgen, saved)
+        # The sync hold was armed with the short timer. Wait it out before
+        # putting mac-holdtime back, including when a stage assertion failed.
+        _, gone = topotest.run_and_expect(
+            partial(check_move_mac_gone, tgen), None, count=40, wait=3
+        )
+        if gone:
+            logger.error("MAC still present when restoring mac-holdtime: %s", gone)
+        move_restore_holdtime(tgen)
+
+    # Cleanup must have left nothing behind (checked after the finally so a
+    # test failure is reported first and a cleanup failure is not masked).
+    _, result = topotest.run_and_expect(
+        partial(check_move_residual, tgen, saved), None, count=40, wait=3
+    )
+    assert result is None, "cleanup left state behind: %s" % result
+
+
+def test_evpn_mac_move_to_es_nhg_inactive(tgen_and_ip_version):
+    """
+    A remote MAC changes from a single VTEP to an ES while the ES nexthop
+    group is inactive on the observer (torm11, Type-1 routes dropped).
+
+    1. MAC learnt without ESI: zebra and the kernel show dst <torm21>, no nhid.
+    2. MAC re-advertised with the ESI: zebra shows the ES, BGP carries the ESI
+       and the kernel must have no FDB entry (the old dst entry is deleted).
+    3. Type-1 routes released: the ES gets both VTEPs and an active NHG, and
+       the kernel entry becomes nhid <ES group> with no dst and no
+       "Cannot replace an existing non nexthop fdb" error.
+    4. Cleanup: nothing of the test is left in any layer.
+    """
+    tgen, _ = tgen_and_ip_version
+
+    skip = vxlan_dynamic_nh_fdb_skip_reason()
+    if skip:
+        pytest.skip(skip)
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    run_mac_move_case(tgen, hold_ead=True)
+
+
+def test_evpn_mac_move_to_es_nhg_active(tgen_and_ip_version):
+    """
+    Control for test_evpn_mac_move_to_es_nhg_inactive: the same move with the
+    ES nexthop group active the whole time. The kernel entry must go straight
+    from dst <torm21> to nhid <ES group>.
+    """
+    tgen, _ = tgen_and_ip_version
+
+    skip = vxlan_dynamic_nh_fdb_skip_reason()
+    if skip:
+        pytest.skip(skip)
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    run_mac_move_case(tgen, hold_ead=False)
+
+
+if __name__ == "__main__":
+    args = ["-s"] + sys.argv[1:]
+    sys.exit(pytest.main(args))

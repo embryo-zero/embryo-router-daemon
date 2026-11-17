@@ -1,0 +1,3941 @@
+#!/usr/bin/env python
+# SPDX-License-Identifier: ISC
+#
+# evpn.py
+# Library of helper functions for EVPN testing
+#
+# Copyright (c) 2025 by Nvidia Corporation
+#
+
+"""
+evpn.py: Library of helper functions for EVPN testing
+"""
+
+import ipaddress
+import json
+import re
+import shlex
+import sys
+from lib import topotest
+from lib.topolog import logger
+
+
+def _evpn_elide_ifindex(data):
+    if isinstance(data, dict):
+        data.pop("ifindex", None)
+        for value in data.values():
+            _evpn_elide_ifindex(value)
+        return
+    if isinstance(data, list):
+        for value in data:
+            _evpn_elide_ifindex(value)
+
+
+def _evpn_normalize_vni_json(output_json, vni):
+    if not isinstance(output_json, list):
+        return output_json
+    if not output_json:
+        return output_json
+    for entry in output_json:
+        if isinstance(entry, dict) and entry.get("vni") == vni:
+            return entry
+    if len(output_json) == 1 and isinstance(output_json[0], dict):
+        return output_json[0]
+    return output_json
+
+
+def evpn_show_vni_json_elide_ifindex(pe, vni, expected):
+    output_json = pe.vtysh_cmd("show evpn vni {} json".format(vni), isjson=True)
+    output_json = _evpn_normalize_vni_json(output_json, vni)
+    _evpn_elide_ifindex(output_json)
+    return topotest.json_cmp(output_json, expected)
+
+
+def evpn_check_vni_macs_present(tgen, router, vni, maclist):
+    result = router.vtysh_cmd("show evpn mac vni {} json".format(vni), isjson=True)
+    for rname, ifname in maclist:
+        m = tgen.net.macs[(rname, ifname)]
+        if m not in result["macs"]:
+            return "MAC ({}) for interface {} on {} missing on {} from {}".format(
+                m, ifname, rname, router.name, json.dumps(result, indent=4)
+            )
+    return None
+
+
+def evpn_mac_learn_test(host, local, vni=101):
+    "check the host MAC gets learned by the VNI"
+    host_output = host.vtysh_cmd("show interface {}-eth0".format(host.name))
+    int_lines = host_output.splitlines()
+    mac = None
+    for line in int_lines:
+        line_items = line.split(": ")
+        if "HWaddr" in line_items[0]:
+            mac = line_items[1]
+            break
+    assert mac is not None, "Failed to find host MAC for {}".format(host.name)
+
+    mac_output = local.vtysh_cmd("show evpn mac vni {} mac {} json".format(vni, mac))
+    mac_output_json = json.loads(mac_output)
+    assertmsg = "Local MAC output does not match interface mac {}".format(mac)
+    assert mac_output_json[mac]["type"] == "local", assertmsg
+
+
+def evpn_mac_test_local_remote(local, remote, skip_missing_remote_vni=False):
+    "test MAC transfer between local and remote"
+    local_output = local.vtysh_cmd("show evpn mac vni all json")
+    remote_output = remote.vtysh_cmd("show evpn mac vni all json")
+    local_output_vni = local.vtysh_cmd("show evpn vni detail json")
+    local_output_json = json.loads(local_output)
+    remote_output_json = json.loads(remote_output)
+    local_output_vni_json = json.loads(local_output_vni)
+
+    for vni in local_output_json:
+        if skip_missing_remote_vni and vni not in remote_output_json:
+            continue
+        mac_list = local_output_json[vni]["macs"]
+        for mac in mac_list:
+            if mac_list[mac]["type"] == "local" and mac_list[mac]["intf"] != "br101":
+                assertmsg = "JSON output mismatches local: {} remote: {}".format(
+                    local_output_vni_json[0]["vtepIp"],
+                    remote_output_json[vni]["macs"][mac]["remoteVtep"],
+                )
+                assert (
+                    remote_output_json[vni]["macs"][mac]["remoteVtep"]
+                    == local_output_vni_json[0]["vtepIp"]
+                ), assertmsg
+
+
+def evpn_ip_learn_test(tgen, host, local, remote, ip_addr, vni=101, count=30, wait=1):
+    "check the host IP gets learned by the VNI"
+    host_output = host.vtysh_cmd("show interface {}-eth0".format(host.name))
+    int_lines = host_output.splitlines()
+    mac = None
+    for line in int_lines:
+        line_items = line.split(": ")
+        if "HWaddr" in line_items[0]:
+            mac = line_items[1]
+            break
+    print(host_output)
+    assert mac is not None, "Failed to find host MAC for {}".format(host.name)
+
+    # check we have a local association between the MAC and IP
+    local_output_json = {}
+
+    def _local_has_neighbor():
+        nonlocal local_output_json
+        local_output = local.vtysh_cmd(
+            "show evpn mac vni {} mac {} json".format(vni, mac)
+        )
+        print(local_output)
+        try:
+            local_output_json = json.loads(local_output)
+        except json.JSONDecodeError:
+            return False
+        if mac not in local_output_json:
+            return False
+        neighbors = local_output_json[mac]["neighbors"]
+        if neighbors == "none":
+            return False
+        if not neighbors["active"]:
+            return False
+        return True
+
+    _, result = topotest.run_and_expect(
+        _local_has_neighbor, True, count=count, wait=wait
+    )
+    assertmsg = "Failed to learn local IP address on host {}".format(host.name)
+    assert result == True, assertmsg
+
+    mac_type = local_output_json[mac]["type"]
+    learned_ip = local_output_json[mac]["neighbors"]["active"][0]
+    assertmsg = "local learned mac wrong type: {} ".format(mac_type)
+    assert mac_type == "local", assertmsg
+
+    assertmsg = (
+        "learned address mismatch with configured address host: {} learned: {}".format(
+            ip_addr, learned_ip
+        )
+    )
+    assert ip_addr == learned_ip, assertmsg
+
+    # now lets check the remote
+    remote_output_json = {}
+
+    def _remote_has_neighbor():
+        nonlocal remote_output_json
+        remote_output = remote.vtysh_cmd(
+            "show evpn mac vni {} mac {} json".format(vni, mac)
+        )
+        print(remote_output)
+        try:
+            remote_output_json = json.loads(remote_output)
+        except json.JSONDecodeError:
+            return False
+        if mac not in remote_output_json:
+            return False
+        neighbors = remote_output_json[mac]["neighbors"]
+        if neighbors == "none":
+            return False
+        # due to a kernel quirk, learned IPs can be inactive
+        if not (neighbors["active"] or neighbors["inactive"]):
+            return False
+        return True
+
+    _, result = topotest.run_and_expect(
+        _remote_has_neighbor, True, count=count, wait=wait
+    )
+    assertmsg = "{} remote learned mac no address: {} ".format(host.name, mac)
+    # some debug for this failure
+    if not result:
+        log_output = remote.run("cat zebra.log")
+        print(log_output)
+
+    assert result == True, assertmsg
+    if remote_output_json[mac]["neighbors"]["active"]:
+        learned_ip = remote_output_json[mac]["neighbors"]["active"][0]
+    else:
+        learned_ip = remote_output_json[mac]["neighbors"]["inactive"][0]
+    mac_type = remote_output_json[mac]["type"]
+    assertmsg = "remote learned mac wrong type: {} ".format(mac_type)
+    assert mac_type == "remote", assertmsg
+
+    assertmsg = "remote learned address mismatch with configured address host: {} learned: {}".format(
+        ip_addr, learned_ip
+    )
+    assert ip_addr == learned_ip, assertmsg
+
+
+def evpn_verify_vni_remote_vteps(router, vni_list, expected_vteps):
+    """
+    Helper function to verify remote VTEPs for given L2VNIs.
+
+    This function performs comprehensive verification of remote VTEPs:
+    1. Checks remote VTEPs are learned via EVPN control plane (IMET route info
+       synced in zebra using "show evpn vni <vni> json")
+    2. Verifies HREP entries exist in bridge FDB ("bridge -j fdb show") with:
+       - MAC address is all zeros (00:00:00:00:00:00)
+       - src_vni field matches one of the VNIs in vni_list
+       - Destination IP matches expected VTEP
+
+    Parameters
+    ----------
+    * `router`: router object to check
+    * `vni_list`: list of VNI strings/integers to verify (e.g., ["1000111", "1000112"])
+    * `expected_vteps`: list of expected remote VTEP IP addresses (IPv4 or IPv6)
+
+    Returns
+    -------
+    None on success, error string on failure (for use with topotest.run_and_expect)
+
+    Usage
+    -----
+    from functools import partial
+    from lib import topotest
+    from lib.evpn import evpn_verify_vni_remote_vteps
+
+    expected_remote_vteps = ["2006:20:20::1", "2006:20:20::2", "2006:20:20::30"]
+    vni_list = ["1000111", "1000112"]
+    test_func = partial(evpn_verify_vni_remote_vteps, router, vni_list, expected_remote_vteps)
+    _, result = topotest.run_and_expect(test_func, None, count=30, wait=1)
+    assert result is None, f"Remote VTEP verification failed: {result}"
+    """
+    # Normalize VNI list to integers for consistent comparison
+    vni_list = [int(vni) for vni in vni_list]
+
+    for vni in vni_list:
+        # Get VNI details in JSON format
+        output = router.vtysh_cmd(f"show evpn vni {vni} json", isjson=True)
+
+        if not output:
+            return f"No output for VNI {vni}"
+
+        # Check if VNI is L2
+        vni_type = output.get("type")
+        if vni_type != "L2":
+            return f"VNI {vni} is not L2VNI"
+
+        # Check if remoteVteps key exists
+        if "remoteVteps" not in output:
+            return f"VNI {vni}: 'remoteVteps' key not found in output"
+
+        # Extract remote VTEP IPs
+        remote_vteps = output.get("remoteVteps", [])
+        remote_vtep_ips = [vtep["ip"] for vtep in remote_vteps if "ip" in vtep]
+
+        logger.info(
+            f"{router.name} VNI {vni}: Found {len(remote_vtep_ips)} remote VTEPs: {remote_vtep_ips}"
+        )
+
+        # Check if all expected VTEPs are present
+        for expected_vtep in expected_vteps:
+            if expected_vtep not in remote_vtep_ips:
+                return (
+                    f"VNI {vni}: Expected remote VTEP {expected_vtep} not found. "
+                    f"Found: {remote_vtep_ips}"
+                )
+
+        # Check if there are any unexpected VTEPs
+        for remote_vtep_ip in remote_vtep_ips:
+            if remote_vtep_ip not in expected_vteps:
+                return (
+                    f"VNI {vni}: Unexpected remote VTEP {remote_vtep_ip} found. "
+                    f"Expected: {expected_vteps}"
+                )
+
+        # Verify numRemoteVteps matches
+        num_remote_vteps = output.get("numRemoteVteps", 0)
+        if num_remote_vteps != len(expected_vteps):
+            return (
+                f"VNI {vni}: numRemoteVteps mismatch. "
+                f"Expected: {len(expected_vteps)}, Found: {num_remote_vteps}"
+            )
+
+    # Verify HREP entries in bridge FDB for remote VTEPs
+    logger.info(f"{router.name}: Checking bridge FDB for HREP entries")
+    fdb_output = router.run("bridge -j fdb show")
+    try:
+        fdb_entries = json.loads(fdb_output)
+    except json.JSONDecodeError:
+        return f"Failed to parse bridge FDB output as JSON"
+
+    # Build dictionary: src_vni -> [list of dst IPs] for MAC all zeros entries
+    vni_to_dsts = {}
+    for entry in fdb_entries:
+        # HREP entries have MAC all zeros, dst, and src_vni fields
+        if (
+            entry.get("mac") == "00:00:00:00:00:00"
+            and "dst" in entry
+            and "src_vni" in entry
+        ):
+            src_vni = entry["src_vni"]  # Already an integer from JSON
+            dst_ip = entry["dst"]
+
+            if src_vni not in vni_to_dsts:
+                vni_to_dsts[src_vni] = []
+            vni_to_dsts[src_vni].append(dst_ip)
+
+            logger.debug(
+                f"{router.name}: Found HREP entry - VNI {src_vni} -> VTEP {dst_ip}"
+            )
+
+    logger.info(
+        f"{router.name}: Bridge FDB HREP entries by VNI: {dict((k, len(v)) for k, v in vni_to_dsts.items())}"
+    )
+
+    # Verify each L2VNI has HREP entries for all expected VTEPs
+    for vni in vni_list:
+        if vni not in vni_to_dsts:
+            return (
+                f"Bridge FDB: No HREP entries found for VNI {vni}. "
+                f"Available VNIs: {list(vni_to_dsts.keys())}"
+            )
+
+        fdb_vteps = vni_to_dsts[vni]
+
+        # Check all expected VTEPs are present for this VNI
+        for expected_vtep in expected_vteps:
+            if expected_vtep not in fdb_vteps:
+                return (
+                    f"Bridge FDB: VNI {vni} missing HREP entry for VTEP {expected_vtep}. "
+                    f"Found VTEPs: {fdb_vteps}"
+                )
+
+    return None
+
+
+def evpn_verify_vni_vtep_src_ip(
+    router, expected_vtep_ip, vni_list, vni_type="L2", vxlan_device=None
+):
+    """
+    Helper function to verify VTEP source IP is correctly configured in kernel and FRR.
+
+    This function verifies that the expected VTEP source IP is correctly configured in:
+    1. Kernel VXLAN device (via "ip -d link show")
+    2. FRR interface view (via "show interface <vxlan_device> json") - vtepIp field
+    3. FRR Zebra (via "show evpn vni <vni> json")
+    4. FRR BGP (via "show bgp l2vpn evpn vni <vni> json")
+
+    Parameters
+    ----------
+    * `router`: router object to check
+    * `expected_vtep_ip`: expected VTEP source IP address (IPv4 or IPv6 string)
+    * `vni_list`: list of VNI strings/integers to verify (e.g., ["1000111", "1000112"])
+    * `vni_type`: "L2" or "L3" to determine which JSON field to check (default: "L2")
+    * `vxlan_device`: kernel VXLAN device name to check (e.g., "vxlan48", "vxlan99").
+                      If None, kernel check is skipped.
+
+    Returns
+    -------
+    None on success, error string on failure (for use with topotest.run_and_expect)
+
+    Usage
+    -----
+    from functools import partial
+    from lib import topotest
+    from lib.evpn import evpn_verify_vni_vtep_src_ip
+
+    # For L2 VNIs
+    vni_list = ["1000111", "1000112"]
+    test_func = partial(
+        evpn_verify_vni_vtep_src_ip,
+        router,
+        "2006:20:20::1",
+        vni_list,
+        vni_type="L2",
+        vxlan_device="vxlan48"
+    )
+    _, result = topotest.run_and_expect(test_func, None, count=30, wait=1)
+    assert result is None, f"VTEP source IP verification failed: {result}"
+
+    # For L3 VNIs
+    l3vni_list = ["104001", "104002"]
+    test_func = partial(
+        evpn_verify_vni_vtep_src_ip,
+        router,
+        "2006:20:20::1",
+        l3vni_list,
+        vni_type="L3",
+        vxlan_device="vxlan99"
+    )
+    _, result = topotest.run_and_expect(test_func, None, count=30, wait=1)
+    assert result is None, f"VTEP source IP verification failed: {result}"
+    """
+
+    # Check kernel VXLAN device if provided
+    if vxlan_device:
+        kernel_output = router.run(f"ip -d link show {vxlan_device}")
+        check_src_ip = f"local {expected_vtep_ip}"
+
+        if check_src_ip not in kernel_output:
+            return (
+                f"Kernel VTEP src IP verification failed for {vxlan_device}. "
+                f"Expected 'local {expected_vtep_ip}' not found in output"
+            )
+
+        logger.info(
+            f"{router.name}: Kernel VTEP src IP correct for {vxlan_device}: {expected_vtep_ip}"
+        )
+
+        # Check FRR interface view matches kernel
+        frr_intf_output = router.vtysh_cmd(
+            f"show interface {vxlan_device} json", isjson=True
+        )
+
+        if not frr_intf_output:
+            return f"No output from 'show interface {vxlan_device} json'"
+
+        if not isinstance(frr_intf_output, dict):
+            return (
+                f"Invalid output format from 'show interface {vxlan_device} json', "
+                f"expected dict, got {type(frr_intf_output)}"
+            )
+
+        # The output is a dict with interface name as key
+        if vxlan_device not in frr_intf_output:
+            return (
+                f"Interface {vxlan_device} not found in FRR interface output. "
+                f"Available interfaces: {list(frr_intf_output.keys())}"
+            )
+
+        intf_data = frr_intf_output[vxlan_device]
+        frr_vtep_ip = intf_data.get("vtepIp")
+
+        if not frr_vtep_ip:
+            return (
+                f"Field 'vtepIp' not found in FRR interface output for {vxlan_device}"
+            )
+
+        if frr_vtep_ip != expected_vtep_ip:
+            return (
+                f"FRR interface VTEP IP mismatch for {vxlan_device}. "
+                f"Expected: {expected_vtep_ip}, Found: {frr_vtep_ip}"
+            )
+
+        logger.info(
+            f"{router.name}: FRR interface VTEP IP correct for {vxlan_device}: {frr_vtep_ip}"
+        )
+
+    # Check FRR Zebra for each VNI
+    for vni in vni_list:
+        output = router.vtysh_cmd(f"show evpn vni {vni} json", isjson=True)
+
+        if not output:
+            return f"VNI {vni}: No output from 'show evpn vni {vni} json'"
+
+        # Determine which JSON field to check based on VNI type
+        if vni_type == "L2":
+            vtep_ip_field = "vtepIp"
+        elif vni_type == "L3":
+            vtep_ip_field = "localVtepIp"
+        else:
+            return f"VNI {vni}: Invalid VNI type '{vni_type}'. Must be 'L2' or 'L3'"
+
+        if vtep_ip_field not in output:
+            return f"VNI {vni}: Field '{vtep_ip_field}' not found in Zebra output"
+
+        vtep_ip = output[vtep_ip_field]
+        if vtep_ip != expected_vtep_ip:
+            return (
+                f"VNI {vni}: Zebra VTEP src IP mismatch. "
+                f"Expected: {expected_vtep_ip}, Found: {vtep_ip}"
+            )
+
+        logger.info(
+            f"{router.name}: Zebra VTEP src IP correct for VNI {vni}: {vtep_ip}"
+        )
+
+    # Check FRR BGP for each VNI
+    for vni in vni_list:
+        bgp_output = router.vtysh_cmd(
+            f"show bgp l2vpn evpn vni {vni} json", isjson=True
+        )
+
+        if not bgp_output:
+            return f"VNI {vni}: No output from 'show bgp l2vpn evpn vni {vni} json'"
+
+        if "originatorIp" not in bgp_output:
+            return f"VNI {vni}: Field 'originatorIp' not found in BGP output"
+
+        bgp_vtep_ip = bgp_output["originatorIp"]
+        if bgp_vtep_ip != expected_vtep_ip:
+            return (
+                f"VNI {vni}: BGP VTEP src IP (originatorIp) mismatch. "
+                f"Expected: {expected_vtep_ip}, Found: {bgp_vtep_ip}"
+            )
+
+        logger.info(
+            f"{router.name}: BGP VTEP src IP correct for VNI {vni}: {bgp_vtep_ip}"
+        )
+
+    return None
+
+
+def evpn_verify_vni_state(router, vni_list, vni_type="L2", expected_state="Up"):
+    """
+    Helper function to verify VNI state and configuration.
+
+    This function checks that VNIs are properly configured and operational by
+    querying "show evpn vni <vni> json". For L2 VNIs, it additionally verifies
+    remoteVteps are present.
+
+    Parameters
+    ----------
+    * `router`: router object to check
+    * `vni_list`: list of VNI strings/integers to verify (e.g., ["1000111", "1000112"])
+    * `vni_type`: "L2" or "L3" to determine which checks to perform (default: "L2")
+    * `expected_state`: expected VNI state (default: "Up")
+
+    Returns
+    -------
+    None on success, error string on failure (for use with topotest.run_and_expect)
+
+    Usage
+    -----
+    from functools import partial
+    from lib import topotest
+    from lib.evpn import evpn_verify_vni_state
+
+    # For L2 VNIs
+    l2vni_list = ["1000111", "1000112"]
+    test_func = partial(
+        evpn_verify_vni_state,
+        router,
+        l2vni_list,
+        vni_type="L2"
+    )
+    _, result = topotest.run_and_expect(test_func, None, count=30, wait=1)
+    assert result is None, f"VNI state verification failed: {result}"
+
+    # For L3 VNIs
+    l3vni_list = ["104001", "104002"]
+    test_func = partial(
+        evpn_verify_vni_state,
+        router,
+        l3vni_list,
+        vni_type="L3"
+    )
+    _, result = topotest.run_and_expect(test_func, None, count=30, wait=1)
+    assert result is None, f"L3 VNI state verification failed: {result}"
+    """
+
+    for vni in vni_list:
+        # Get VNI details in JSON format
+        output = router.vtysh_cmd(f"show evpn vni {vni} json", isjson=True)
+
+        if not output:
+            return f"VNI {vni}: No output from 'show evpn vni {vni} json'"
+
+        # Check if VNI exists
+        if "vni" not in output:
+            return (
+                f"VNI {vni}: 'vni' field not found in output, VNI may not be configured"
+            )
+
+        # Verify VNI number matches
+        if str(output["vni"]) != str(vni):
+            return (
+                f"VNI {vni}: VNI number mismatch. "
+                f"Expected: {vni}, Found: {output['vni']}"
+            )
+
+        # Check VNI state if available
+        if "state" in output:
+            vni_state = output["state"]
+            if vni_state != expected_state:
+                return (
+                    f"VNI {vni}: State mismatch. "
+                    f"Expected: {expected_state}, Found: {vni_state}"
+                )
+            logger.info(f"{router.name}: VNI {vni} state is {vni_state}")
+
+        # For L2 VNIs, perform additional checks
+        if vni_type == "L2":
+            # Check if this is indeed an L2 VNI
+            vni_type_field = output.get("type")
+            if vni_type_field is not None and vni_type_field != "L2":
+                return f"VNI {vni}: Expected L2 VNI but found type: {vni_type_field}"
+
+            # Check numRemoteVteps field exists first. Some FRR versions omit
+            # the 'remoteVteps' array entirely when the count is zero, so we
+            # must look at the counter before assuming the array will be
+            # present.
+            if "numRemoteVteps" not in output:
+                return f"VNI {vni}: 'numRemoteVteps' field not found in output"
+
+            num_remote_vteps = output.get("numRemoteVteps", 0)
+
+            # If there are zero remote VTEPs, that's valid – just log and skip
+            # the detailed remoteVteps checks.
+            if num_remote_vteps == 0:
+                logger.info(
+                    "%s: VNI %s (L2) currently has 0 remote VTEPs",
+                    router.name,
+                    vni,
+                )
+            else:
+                # When numRemoteVteps is non-zero, the detailed 'remoteVteps'
+                # list must be present and consistent with the counter.
+                if "remoteVteps" not in output:
+                    return f"VNI {vni}: 'remoteVteps' field not found in output"
+
+                remote_vteps = output.get("remoteVteps", [])
+                actual_remote_vtep_count = len(remote_vteps)
+
+                # Verify numRemoteVteps matches actual count
+                if num_remote_vteps != actual_remote_vtep_count:
+                    return (
+                        f"VNI {vni}: numRemoteVteps mismatch. "
+                        f"Field says {num_remote_vteps}, but found {actual_remote_vtep_count} entries"
+                    )
+
+                logger.info(
+                    "%s: VNI %s (L2) has %s remote VTEPs",
+                    router.name,
+                    vni,
+                    num_remote_vteps,
+                )
+
+                # Log remote VTEP IPs if available
+                if remote_vteps:
+                    remote_vtep_ips = [
+                        vtep.get("ip", "unknown") for vtep in remote_vteps
+                    ]
+                    logger.info(
+                        "%s: VNI %s remote VTEPs: %s",
+                        router.name,
+                        vni,
+                        remote_vtep_ips,
+                    )
+
+            # Validate VLAN and bridge for L2VNIs as well. These come from
+            # zebra_evpn's JSON ("vlan", "bridge").
+            if "vlan" not in output:
+                return f"VNI {vni}: 'vlan' field not found in EVPN VNI JSON output"
+            if "bridge" not in output:
+                return f"VNI {vni}: 'bridge' field not found in EVPN VNI JSON output"
+
+            vlan = output.get("vlan")
+            bridge = output.get("bridge")
+            logger.info(
+                "%s: VNI %s (L2) vlan=%s bridge=%s",
+                router.name,
+                vni,
+                vlan,
+                bridge,
+            )
+
+        # For L3 VNIs, perform L3-specific checks, including newly added
+        # VLAN/bridge fields from "show evpn vni <vni> json".
+        elif vni_type == "L3":
+            # Check if this is indeed an L3 VNI
+            vni_type_field = output.get("type")
+            if vni_type_field is not None and vni_type_field != "L3":
+                return f"VNI {vni}: Expected L3 VNI but found type: {vni_type_field}"
+
+            # Check for VRF association (field name may vary between FRR
+            # versions; prefer "tenantVrf", fall back to "vrf").
+            vrf_name = output.get("tenantVrf", output.get("vrf"))
+            if vrf_name:
+                logger.info(
+                    f"{router.name}: VNI {vni} (L3) associated with VRF {vrf_name}"
+                )
+            else:
+                logger.warning(f"{router.name}: VNI {vni} (L3) has no VRF association")
+
+            # Validate presence of VLAN and bridge for L3VNI. These fields are
+            # provided by zebra_vxlan's L3VNI JSON ("vlan", "bridge").
+            if "vlan" not in output:
+                return f"VNI {vni}: 'vlan' field not found in EVPN VNI JSON output"
+            if "bridge" not in output:
+                return f"VNI {vni}: 'bridge' field not found in EVPN VNI JSON output"
+
+            vlan = output.get("vlan")
+            bridge = output.get("bridge")
+            logger.info(
+                "%s: VNI %s (L3) vlan=%s bridge=%s",
+                router.name,
+                vni,
+                vlan,
+                bridge,
+            )
+
+            # Check for L3VNI-specific fields such as routerMac when present.
+            router_mac = output.get("routerMac")
+            if router_mac:
+                logger.info(
+                    "%s: VNI %s (L3) router MAC: %s",
+                    router.name,
+                    vni,
+                    router_mac,
+                )
+
+        else:
+            return f"VNI {vni}: Invalid VNI type '{vni_type}'. Must be 'L2' or 'L3'"
+
+    return None
+
+
+def evpn_verify_bgp_vni_state(
+    router, vni_list, expected_originator_ip=None, expected_fields=None
+):
+    """
+    Helper function to verify BGP L2VNI state and configuration.
+
+    This function checks the BGP EVPN control plane state for L2VNIs by querying
+    'show bgp l2vpn evpn vni <vni> json'. It validates:
+    - VNI is configured in BGP
+    - Route Distinguisher (RD) is present
+    - Originator IP (VTEP source IP) matches expected value if provided
+    - VNI is installed in kernel (inKernel field, logs warning if False)
+    - Additional fields if specified via expected_fields parameter
+
+    Parameters
+    ----------
+    * `router`: router object to check
+    * `vni_list`: list of VNI strings/integers to verify (e.g., ["1000111", "1000112"])
+    * `expected_originator_ip`: expected VTEP originator IP address (optional, for backward compatibility)
+    * `expected_fields`: dict of field names and expected values to validate (optional)
+      Example: {"advertiseGatewayMacip": "Enabled", "inKernel": True}
+
+    Returns
+    -------
+    None on success, error string on failure (for use with topotest.run_and_expect)
+
+    Usage
+    -----
+    from functools import partial
+    from lib import topotest
+    from lib.evpn import evpn_verify_bgp_vni_state
+
+    # Basic check - just verify VNIs exist in BGP
+    vni_list = ["1000111", "1000112"]
+    test_func = partial(
+        evpn_verify_bgp_vni_state,
+        router,
+        vni_list
+    )
+    _, result = topotest.run_and_expect(test_func, None, count=30, wait=1)
+    assert result is None, f"BGP VNI state verification failed: {result}"
+
+    # With originator IP validation (backward compatible)
+    test_func = partial(
+        evpn_verify_bgp_vni_state,
+        router,
+        vni_list,
+        expected_originator_ip="2006:20:20::1"
+    )
+    _, result = topotest.run_and_expect(test_func, None, count=30, wait=1)
+    assert result is None, f"BGP VNI state verification failed: {result}"
+
+    # With flexible field validation (L2VNI)
+    test_func = partial(
+        evpn_verify_bgp_vni_state,
+        router,
+        vni_list,
+        expected_fields={
+            "originatorIp": "2006:20:20::1",
+            "advertiseGatewayMacip": "Enabled",
+            "inKernel": True
+        }
+    )
+    _, result = topotest.run_and_expect(test_func, None, count=30, wait=1)
+    assert result is None, f"BGP VNI state verification failed: {result}"
+
+    # For L3VNI with system IP/MAC (if BGP VNI command supports L3VNI)
+    test_func = partial(
+        evpn_verify_bgp_vni_state,
+        router,
+        l3vni_list,
+        expected_fields={
+            "systemIp": "6.0.0.30",
+            "systemMac": "00:00:10:00:1e:07"
+        }
+    )
+    _, result = topotest.run_and_expect(test_func, None, count=30, wait=1)
+    assert result is None, f"BGP L3VNI state verification failed: {result}"
+    """
+
+    # Normalize VNI list to integers for consistent comparison
+    vni_list = [int(vni) for vni in vni_list]
+
+    for vni in vni_list:
+        # Get BGP L2VPN EVPN VNI state
+        bgp_output = router.vtysh_cmd(
+            f"show bgp l2vpn evpn vni {vni} json", isjson=True
+        )
+
+        if not bgp_output:
+            return f"VNI {vni}: No output from 'show bgp l2vpn evpn vni {vni} json'"
+
+        if not isinstance(bgp_output, dict):
+            return (
+                f"VNI {vni}: Invalid BGP VNI output format, "
+                f"expected dict, got {type(bgp_output)}"
+            )
+
+        # Check basic VNI fields
+        bgp_vni = bgp_output.get("vni")
+        if bgp_vni is None:
+            return f"VNI {vni}: Field 'vni' not found in BGP output"
+
+        if str(bgp_vni) != str(vni):
+            return (
+                f"VNI {vni}: VNI number mismatch in BGP. "
+                f"Expected: {vni}, Found: {bgp_vni}"
+            )
+
+        # Check if VNI is installed in kernel
+        in_kernel = bgp_output.get("inKernel")
+        if in_kernel is not None:
+            if in_kernel is True:
+                logger.info(f"{router.name}: VNI {vni} is installed in kernel")
+            else:
+                logger.warning(
+                    f"{router.name}: VNI {vni} is NOT installed in kernel (inKernel: {in_kernel})"
+                )
+
+        # Check Route Distinguisher (RD)
+        rd = bgp_output.get("rd")
+        if not rd:
+            return f"VNI {vni}: Route Distinguisher (RD) not found in BGP output"
+
+        logger.info(f"{router.name}: VNI {vni} BGP RD: {rd}")
+
+        # Check Originator IP (VTEP source IP)
+        originator_ip = bgp_output.get("originatorIp")
+        if not originator_ip:
+            return f"VNI {vni}: Originator IP not found in BGP output"
+
+        logger.info(f"{router.name}: VNI {vni} BGP Originator IP: {originator_ip}")
+
+        # Validate originator IP if expected value provided (backward compatibility)
+        if expected_originator_ip is not None:
+            if originator_ip != expected_originator_ip:
+                return (
+                    f"VNI {vni}: Originator IP mismatch. "
+                    f"Expected: {expected_originator_ip}, Found: {originator_ip}"
+                )
+
+        # Validate additional expected fields if provided
+        if expected_fields is not None:
+            for field_name, expected_value in expected_fields.items():
+                actual_value = bgp_output.get(field_name)
+
+                if actual_value is None:
+                    return (
+                        f"VNI {vni}: Field '{field_name}' not found in BGP output. "
+                        f"Expected: {expected_value}"
+                    )
+
+                if actual_value != expected_value:
+                    return (
+                        f"VNI {vni}: Field '{field_name}' mismatch. "
+                        f"Expected: {expected_value}, Found: {actual_value}"
+                    )
+
+                logger.info(
+                    f"{router.name}: VNI {vni} {field_name}: {actual_value} (validated)"
+                )
+
+        # Log optional informative fields if present
+        adv_gw_macip = bgp_output.get("advertiseGatewayMacip")
+        if adv_gw_macip is not None:
+            logger.info(
+                f"{router.name}: VNI {vni} advertiseGatewayMacip: {adv_gw_macip}"
+            )
+
+        adv_svi_macip = bgp_output.get("advertiseSviMacIp")
+        if adv_svi_macip is not None:
+            logger.info(f"{router.name}: VNI {vni} advertiseSviMacIp: {adv_svi_macip}")
+
+    return None
+
+
+def evpn_verify_route_advertisement(
+    router, min_type2=None, min_type3=None, min_type5=None
+):
+    """
+    Helper function to verify EVPN routes are advertised.
+
+    This function checks that EVPN routes (Type-2, Type-3, Type-5) are present
+    in BGP by querying "show bgp l2vpn evpn route json".
+
+    Parameters
+    ----------
+    * `router`: router object to check
+    * `min_type2`: minimum number of Type-2 (MAC/IP) routes expected (default: None, no check)
+    * `min_type3`: minimum number of Type-3 (IMET) routes expected (default: None, no check)
+    * `min_type5`: minimum number of Type-5 (IP Prefix) routes expected (default: None, no check)
+
+    Returns
+    -------
+    None on success, error string on failure (for use with topotest.run_and_expect)
+
+    Usage
+    -----
+    from functools import partial
+    from lib import topotest
+    from lib.evpn import evpn_verify_route_advertisement
+
+    # Check that at least some Type-3 routes exist (VTEPs typically advertise these)
+    test_func = partial(
+        evpn_verify_route_advertisement,
+        router,
+        min_type3=1
+    )
+    _, result = topotest.run_and_expect(test_func, None, count=60, wait=1)
+    assert result is None, f"EVPN route advertisement check failed: {result}"
+
+    # Check for specific minimum counts of multiple route types
+    test_func = partial(
+        evpn_verify_route_advertisement,
+        router,
+        min_type2=5,
+        min_type3=2,
+        min_type5=10
+    )
+    _, result = topotest.run_and_expect(test_func, None, count=60, wait=1)
+    assert result is None, f"EVPN route advertisement check failed: {result}"
+    """
+
+    # Get EVPN routes
+    output = router.vtysh_cmd("show bgp l2vpn evpn route json", isjson=True)
+
+    if not output:
+        return "No output from 'show bgp l2vpn evpn route json'"
+
+    if not isinstance(output, dict):
+        return f"Invalid EVPN route output format, expected dict, got {type(output)}"
+
+    # Parse and count EVPN route types
+    # Route keys format: [type]:[0]:[length]:[prefix/mac/ip]
+    # The JSON structure is nested: RD keys contain route keys
+    type2_routes = []  # MAC/IP Advertisement
+    type3_routes = []  # Inclusive Multicast Ethernet Tag (IMET)
+    type5_routes = []  # IP Prefix routes
+
+    for rd_key, rd_data in output.items():
+        # Skip non-dict entries (like "numPrefix")
+        if not isinstance(rd_data, dict):
+            continue
+
+        # Parse route keys within each RD
+        for route_key in rd_data.keys():
+            if route_key.startswith("[2]:"):
+                type2_routes.append(route_key)
+            elif route_key.startswith("[3]:"):
+                type3_routes.append(route_key)
+            elif route_key.startswith("[5]:"):
+                type5_routes.append(route_key)
+
+    # Log current counts
+    logger.info(
+        f"{router.name}: EVPN routes - Type-2: {len(type2_routes)}, "
+        f"Type-3: {len(type3_routes)}, Type-5: {len(type5_routes)}"
+    )
+
+    # Check Type-2 routes if minimum specified
+    if min_type2 is not None:
+        if len(type2_routes) < min_type2:
+            return (
+                f"Type-2 (MAC/IP) routes insufficient. "
+                f"Expected at least {min_type2}, found {len(type2_routes)}"
+            )
+
+    # Check Type-3 routes if minimum specified
+    if min_type3 is not None:
+        if len(type3_routes) < min_type3:
+            return (
+                f"Type-3 (IMET) routes insufficient. "
+                f"Expected at least {min_type3}, found {len(type3_routes)}"
+            )
+
+    # Check Type-5 routes if minimum specified
+    if min_type5 is not None:
+        if len(type5_routes) < min_type5:
+            return (
+                f"Type-5 (IP Prefix) routes insufficient. "
+                f"Expected at least {min_type5}, found {len(type5_routes)}"
+            )
+
+    return None
+
+
+def evpn_type5_prefix_count(router, prefix):
+    """Return the number of matching Type-5 routes in the EVPN BGP table."""
+    address, prefixlen = prefix.split("/", 1)
+    evpn_prefix = "[5]:[0]:[{0}]:[{1}]".format(prefixlen, address)
+    output = router.vtysh_cmd("show bgp l2vpn evpn route type 5")
+    return output.count(evpn_prefix)
+
+
+def evpn_type5_route_distinguishers(router, prefix):
+    """Return the route distinguisher headings carrying a Type-5 prefix."""
+    address, prefixlen = prefix.split("/", 1)
+    evpn_prefix = "[5]:[0]:[{0}]:[{1}]".format(prefixlen, address)
+    route_distinguishers = []
+    current_rd = None
+    output = router.vtysh_cmd("show bgp l2vpn evpn route type 5")
+    for line in output.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Route Distinguisher:"):
+            current_rd = stripped
+        elif evpn_prefix in line and current_rd:
+            route_distinguishers.append(current_rd)
+    return route_distinguishers
+
+
+def evpn_verify_l3vni_nexthops(router, l3vni_list, expected_remote_vteps):
+    """
+    Helper function to verify L3VNI EVPN next-hops from remote VTEPs.
+
+    This function verifies that for each L3VNI, FRR has learned next-hops
+    from the expected remote VTEPs via the EVPN control plane.
+
+    The function parses the JSON output of 'show evpn next-hops vni <vni> json' which has
+    the structure:
+    {
+      "<vtep_ip1>": {
+        "ip": "<vtep_ip1>",
+        "rmac": "<mac>",
+        ...
+      },
+      ...
+    }
+
+    Parameters
+    ----------
+    * `router`: router object to check
+    * `l3vni_list`: list of L3VNI strings to verify (e.g., ["104001", "104002"])
+    * `expected_remote_vteps`: list of expected remote VTEP IPs (IPv4 or IPv6 strings)
+
+    Returns
+    -------
+    None on success, error string on failure (for use with topotest.run_and_expect)
+
+    Usage
+    -----
+    from functools import partial
+    from lib import topotest
+    from lib.evpn import evpn_verify_l3vni_nexthops
+
+    l3vni_list = ["104001", "104002"]
+    expected_remote_vteps = ["2006:20:20::1", "2006:20:20::2", "2006:20:20::31"]
+
+    test_func = partial(
+        evpn_verify_l3vni_nexthops,
+        router,
+        l3vni_list,
+        expected_remote_vteps
+    )
+    _, result = topotest.run_and_expect(test_func, None, count=60, wait=1)
+    assert result is None, f"L3VNI next-hop verification failed: {result}"
+    """
+    import json
+    import ipaddress
+
+    for vni in l3vni_list:
+        # Get JSON output to parse next-hop list
+        json_output = router.vtysh_cmd(
+            f"show evpn next-hops vni {vni} json", isjson=True
+        )
+
+        if not json_output:
+            return (
+                f"VNI {vni}: No JSON output from 'show evpn next-hops vni {vni} json'"
+            )
+
+        if not isinstance(json_output, dict):
+            return f"VNI {vni}: Invalid JSON output format, expected dict, got {type(json_output)}"
+
+        # Extract VTEP IPs from next-hop entries (keys are IP addresses)
+        # Skip metadata keys like "numNextHops" by validating IP addresses
+        found_vtep_ips = set()
+        for key in json_output.keys():
+            try:
+                # Validate if key is a valid IPv4 or IPv6 address
+                ipaddress.ip_address(key)
+                found_vtep_ips.add(key)
+            except ValueError:
+                # Skip non-IP keys (e.g., "numNextHops")
+                continue
+
+        if not found_vtep_ips:
+            return f"VNI {vni}: No next-hops found in JSON output (expected {len(expected_remote_vteps)} remote VTEPs)"
+
+        logger.info(f"{router.name}: VNI {vni} has {len(found_vtep_ips)} next-hops")
+
+        # Verify each expected remote VTEP is present as a next-hop
+        for expected_vtep in expected_remote_vteps:
+            if expected_vtep not in found_vtep_ips:
+                return (
+                    f"VNI {vni}: Expected remote VTEP {expected_vtep} not found in next-hop table. "
+                    f"Expected VTEPs: {expected_remote_vteps}, Found VTEPs: {sorted(found_vtep_ips)}"
+                )
+
+        logger.info(
+            f"{router.name}: VNI {vni} has next-hops from all expected remote VTEPs"
+        )
+
+        # Log details for each next-hop
+        for vtep_ip in sorted(found_vtep_ips):
+            nexthop_data = json_output.get(vtep_ip, {})
+            rmac = nexthop_data.get("routerMac", "N/A")
+            logger.debug(f"{router.name}: VNI {vni} next-hop {vtep_ip} (RMAC: {rmac})")
+
+    # All VNIs verified successfully
+    return None
+
+
+def evpn_verify_no_remote_vtep_in_l3vni(router, l3vni_list):
+    """
+    Verify L3VNI next-hops contain no remote VTEP entries.
+    Returns None on success, error string on failure (for use with run_and_expect).
+    """
+    import ipaddress
+
+    for vni in l3vni_list:
+        json_output = router.vtysh_cmd(
+            "show evpn next-hops vni {} json".format(vni), isjson=True
+        )
+        if json_output is None:
+            return (
+                f"VNI {vni}: No JSON output from 'show evpn next-hops vni {vni} json'"
+            )
+        if not isinstance(json_output, dict):
+            return f"VNI {vni}: Invalid JSON output format, expected dict, got {type(json_output)}"
+
+        found_vtep_ips = set()
+        for key in json_output.keys():
+            try:
+                ipaddress.ip_address(key)
+                found_vtep_ips.add(key)
+            except ValueError:
+                continue
+        if found_vtep_ips:
+            return "VNI {}: expected no remote VTEPs, found {}".format(
+                vni, sorted(found_vtep_ips)
+            )
+    return None
+
+
+def _discover_vtep_ips(tgen, vtep_routers, vxlan_device="vxlan48"):
+    """
+    Helper function to discover VTEP IP addresses from VXLAN devices.
+
+    Returns dict mapping router names to their VTEP IP addresses.
+    Raises AssertionError on failure with detailed error message.
+    """
+    import json
+
+    vtep_ips = {}
+
+    for rname in vtep_routers:
+        router = tgen.gears[rname]
+        # Get VXLAN device details in JSON format
+        output = router.run(f"ip -j -d link show {vxlan_device}")
+
+        # Check if output is empty - device might not exist
+        if not output or output.strip() == "":
+            raise AssertionError(
+                f"{rname}: No output from 'ip -j -d link show {vxlan_device}'"
+            )
+
+        # Clean kernel message corruption from output
+        # Remove any junk before JSON array starts
+        json_start = output.find("[")
+        if json_start > 0:
+            output = output[json_start:]
+        # Remove inline corruption strings (e.g., "id":0fan-map becomes "id":0)
+        output = output.replace("fan-map ", "")
+
+        try:
+            link_info = json.loads(output)
+            if not link_info or not isinstance(link_info, list) or len(link_info) == 0:
+                raise AssertionError(
+                    f"{rname}: Invalid JSON output from 'ip -j -d link show {vxlan_device}'"
+                )
+
+            # Extract local VTEP IP from linkinfo
+            # Kernel uses "local" for IPv4 and "local6" for IPv6
+            vxlan_info = link_info[0].get("linkinfo", {}).get("info_data", {})
+            local_ip = vxlan_info.get("local6") or vxlan_info.get("local")
+
+            if local_ip:
+                vtep_ips[rname] = local_ip
+                # Detect IP version for logging
+                ip_version = "IPv6" if ":" in local_ip else "IPv4"
+                logger.info(
+                    f"{rname}: Discovered VTEP IP {vtep_ips[rname]} ({ip_version})"
+                )
+            else:
+                raise AssertionError(
+                    f"{rname}: No 'local' or 'local6' field found in {vxlan_device} device info"
+                )
+        except json.JSONDecodeError as e:
+            raise AssertionError(
+                f"{rname}: Failed to parse {vxlan_device} device info as JSON: {e}. "
+                f"Raw output (first 500 chars): {output[:500]}"
+            )
+        except (KeyError, IndexError) as e:
+            raise AssertionError(
+                f"{rname}: Failed to extract {vxlan_device} device info: {e}. "
+                f"Output: {output[:500]}"
+            )
+
+    return vtep_ips
+
+
+def evpn_verify_l3vni_remote_nexthops(
+    tgen, vtep_routers, l3vni_list, vxlan_device="vxlan48"
+):
+    """
+    Helper function to verify L3VNI EVPN next-hops across all VTEPs in a topology.
+
+    This function:
+    1. Discovers VTEP IP addresses from the specified VXLAN device (IPv4/IPv6 agnostic)
+    2. Verifies that each VTEP has learned next-hops from all other (remote) VTEPs for the specified L3VNIs
+
+    Parameters
+    ----------
+    * `tgen`: Topogen object
+    * `vtep_routers`: list of router names that are VTEPs
+                      e.g., ["bordertor-11", "bordertor-12", "tor-22"]
+    * `l3vni_list`: list of L3VNI strings to verify (e.g., ["104001", "104002"])
+    * `vxlan_device`: name of the VXLAN device to query for VTEP IPs (default: "vxlan48")
+
+    Returns
+    -------
+    None on success, raises assertion error on failure
+
+    Usage
+    -----
+    from lib.evpn import evpn_verify_l3vni_remote_nexthops
+
+    vtep_routers = ["bordertor-11", "bordertor-12", "tor-22"]
+    l3vni_list = ["104001", "104002"]
+
+    evpn_verify_l3vni_remote_nexthops(tgen, vtep_routers, l3vni_list)
+    """
+    from functools import partial
+    from lib import topotest
+
+    logger.info(f"Discovering VTEP IPs from {vxlan_device} device (IPv4/IPv6 agnostic)")
+
+    # Discover VTEP addresses using helper function
+    vtep_ips = _discover_vtep_ips(tgen, vtep_routers, vxlan_device)
+
+    # Verify L3VNI next-hops for all VTEPs
+    for rname in vtep_routers:
+        router = tgen.gears[rname]
+
+        # Build expected remote VTEPs list (all VTEPs except itself)
+        local_vtep_ip = vtep_ips[rname]
+        expected_remote_vteps = [ip for ip in vtep_ips.values() if ip != local_vtep_ip]
+
+        logger.info(
+            f"Verifying {rname} (local VTEP: {local_vtep_ip}) - "
+            f"expects next-hops from {len(expected_remote_vteps)} remote VTEPs"
+        )
+
+        # Use library function to check L3VNI next-hops
+        test_func = partial(
+            evpn_verify_l3vni_nexthops, router, l3vni_list, expected_remote_vteps
+        )
+        _, result = topotest.run_and_expect(test_func, None, count=60, wait=1)
+        assert result is None, f"{rname} L3VNI next-hop verification failed: {result}"
+
+
+def evpn_verify_l3vni_rmacs(router, l3vni_list, expected_remote_vteps):
+    """
+    Helper function to verify L3VNI Router MACs (RMACs) from remote VTEPs.
+
+    This function verifies that for each L3VNI:
+    1. FRR has learned RMACs from expected remote VTEPs
+    2. Bridge FDB has entries for each RMAC associated with the L3VNI
+
+    The function parses the JSON output of 'show evpn rmac vni <vni> json' which has
+    the structure:
+    {
+      "numRmacs": <number>,
+      "<rmac1>": {
+        "routerMac": "<mac>",
+        "vtepIp": "<ip>"
+      },
+      ...
+    }
+
+    Parameters
+    ----------
+    * `router`: router object to check
+    * `l3vni_list`: list of L3VNI strings to verify (e.g., ["104001", "104002"])
+    * `expected_remote_vteps`: list of expected remote VTEP IPs (IPv4 or IPv6 strings)
+
+    Returns
+    -------
+    None on success, error string on failure (for use with topotest.run_and_expect)
+
+    Usage
+    -----
+    from functools import partial
+    from lib import topotest
+    from lib.evpn import evpn_verify_l3vni_rmacs
+
+    l3vni_list = ["104001", "104002"]
+    expected_remote_vteps = ["2006:20:20::1", "2006:20:20::2", "2006:20:20::30"]
+
+    test_func = partial(
+        evpn_check_l3vni_rmacs,
+        router,
+        l3vni_list,
+        expected_remote_vteps
+    )
+    _, result = topotest.run_and_expect(test_func, None, count=60, wait=1)
+    assert result is None, f"L3VNI RMAC verification failed: {result}"
+    """
+    import json
+
+    for vni in l3vni_list:
+        # Get JSON output to parse RMAC list
+        json_output = router.vtysh_cmd(f"show evpn rmac vni {vni} json", isjson=True)
+
+        if not json_output:
+            return f"VNI {vni}: No JSON output from 'show evpn rmac vni {vni} json'"
+
+        if not isinstance(json_output, dict):
+            return f"VNI {vni}: Invalid JSON output format, expected dict, got {type(json_output)}"
+
+        # Extract number of RMACs if present
+        num_rmacs = json_output.get("numRmacs", 0)
+
+        # Extract RMAC entries (keys are MAC addresses, except for metadata keys like "numRmacs")
+        rmac_entries = {}
+        for key, value in json_output.items():
+            # Skip non-RMAC keys (metadata keys)
+            if key == "numRmacs" or not isinstance(value, dict):
+                continue
+            # MAC addresses contain colons
+            if ":" in key:
+                rmac_entries[key] = value
+
+        if not rmac_entries:
+            return f"VNI {vni}: No RMACs found in JSON output (expected {len(expected_remote_vteps)} remote VTEPs)"
+
+        logger.info(
+            f"{router.name}: VNI {vni} has {len(rmac_entries)} RMACs (numRmacs: {num_rmacs})"
+        )
+
+        # Collect VTEP IPs from RMAC entries
+        found_vtep_ips = set()
+        for rmac, rmac_data in rmac_entries.items():
+            vtep_ip = rmac_data.get("vtepIp")
+            if vtep_ip:
+                found_vtep_ips.add(vtep_ip)
+
+        # Verify each expected remote VTEP has at least one RMAC
+        for expected_vtep in expected_remote_vteps:
+            if expected_vtep not in found_vtep_ips:
+                return (
+                    f"VNI {vni}: Expected remote VTEP {expected_vtep} not found in RMAC table. "
+                    f"Expected VTEPs: {expected_remote_vteps}, Found VTEPs: {sorted(found_vtep_ips)}"
+                )
+
+        logger.info(
+            f"{router.name}: VNI {vni} has RMACs from all expected remote VTEPs"
+        )
+
+        # Verify each RMAC has a bridge FDB entry for this VNI
+        # Note: Bridge FDB population may lag behind EVPN RMAC learning,
+        # especially on newer kernels (e.g., Ubuntu 24.04 with kernel 6.8+)
+
+        # Debug: Get full bridge FDB output for this VNI to aid troubleshooting
+        full_fdb_cmd = (
+            f"bridge fdb show | grep '{vni}' || echo 'No FDB entries for VNI {vni}'"
+        )
+        full_fdb_output = router.run(full_fdb_cmd)
+        logger.debug(f"{router.name}: VNI {vni} bridge FDB entries:\n{full_fdb_output}")
+
+        for rmac, rmac_data in rmac_entries.items():
+            vtep_ip = rmac_data.get("vtepIp", "unknown")
+            # Query bridge FDB for this RMAC and VNI
+            # Format: "<rmac> dev <vxlan_dev> dst <vtep_ip> src_vni <vni> self permanent"
+            # Use 'grep -i' for case-insensitive MAC matching (some kernels report uppercase)
+            fdb_cmd = f"bridge fdb show | grep -i '{rmac}' | grep '{vni}'"
+            fdb_output = router.run(fdb_cmd)
+
+            if not fdb_output or fdb_output.strip() == "":
+                # Don't immediately fail - return error for retry logic
+                # Bridge FDB may take additional time to sync on some systems
+                return (
+                    f"VNI {vni}: Bridge FDB entry not found for RMAC {rmac} (VTEP: {vtep_ip}). "
+                    f"This may indicate slow bridge FDB sync (common on Ubuntu 24.04+). "
+                    f"Expected format: '<rmac> dev <vxlan_dev> dst {vtep_ip} src_vni {vni} self permanent'"
+                )
+
+            logger.info(
+                f"{router.name}: VNI {vni} RMAC {rmac} (VTEP: {vtep_ip}) found in bridge FDB"
+            )
+
+    return None
+
+
+def _verify_type5_route_advertisement(tgen, vtep_routers, l3vni_list, rt_base="60207"):
+    """
+    Helper function to verify that all VTEPs are advertising Type-5 routes for all L3VNIs.
+
+    RMACs are ONLY installed when Type-5 routes are advertised. This function ensures
+    that all VTEPs are advertising routes before we check for RMACs.
+
+    Parameters
+    ----------
+    * `tgen`: Topogen object
+    * `vtep_routers`: list of router names to check
+    * `l3vni_list`: list of L3VNI strings (e.g., ["104001", "104002"])
+    * `rt_base`: base Route Target (default "60207" for RT:60207:XXXXX)
+
+    Returns
+    -------
+    dict: mapping of {router_name: {vni: bool}} indicating which VNIs have Type-5 routes
+    """
+    results = {}
+
+    for rname in vtep_routers:
+        router = tgen.gears[rname]
+        results[rname] = {}
+
+        for vni in l3vni_list:
+            # Check if router is advertising Type-5 routes for this VNI
+            # Look for Route Target RT:<rt_base>:<vni> in self-originated routes
+            cmd = (
+                f"show bgp l2vpn evpn route self-originate | grep 'RT:{rt_base}:{vni}'"
+            )
+            output = router.vtysh_cmd(cmd, isjson=False)
+
+            has_routes = bool(output and output.strip())
+            results[rname][vni] = has_routes
+
+    return results
+
+
+def evpn_verify_l3vni_remote_rmacs(
+    tgen, vtep_routers, l3vni_list, vxlan_device="vxlan48"
+):
+    """
+    Helper function to verify L3VNI remote RMACs across all VTEPs in a topology.
+
+    This function:
+    1. Discovers VTEP IP addresses from the specified VXLAN device (IPv4/IPv6 agnostic)
+    2. Verifies that each VTEP has learned RMACs from all other (remote) VTEPs for the specified L3VNIs
+
+    Parameters
+    ----------
+    * `tgen`: Topogen object
+    * `vtep_routers`: list of router names that are VTEPs
+                      e.g., ["bordertor-11", "bordertor-12", "tor-21", "tor-22"]
+    * `l3vni_list`: list of L3VNI strings to verify (e.g., ["104001", "104002"])
+    * `vxlan_device`: name of the VXLAN device to query for VTEP IPs (default: "vxlan48")
+
+    Returns
+    -------
+    None on success, raises assertion error on failure
+
+    Usage
+    -----
+    from lib.evpn import evpn_verify_l3vni_remote_rmacs
+
+    vtep_routers = ["bordertor-11", "bordertor-12", "tor-21", "tor-22"]
+    l3vni_list = ["104001", "104002"]
+
+    evpn_verify_l3vni_remote_rmacs(tgen, vtep_routers, l3vni_list)
+    """
+    from functools import partial
+    from lib import topotest
+
+    logger.info(f"Discovering VTEP IPs from {vxlan_device} device (IPv4/IPv6 agnostic)")
+
+    # Discover VTEP addresses using helper function
+    vtep_ips = _discover_vtep_ips(tgen, vtep_routers, vxlan_device)
+
+    logger.info("Pre-check: Verifying Type-5 route advertisement for all L3VNIs")
+    type5_status = _verify_type5_route_advertisement(tgen, vtep_routers, l3vni_list)
+
+    # Verify L3VNI RMACs for all VTEPs
+    for rname in vtep_routers:
+        router = tgen.gears[rname]
+
+        # Build expected remote VTEPs list (all VTEPs except itself)
+        local_vtep_ip = vtep_ips[rname]
+        expected_remote_vteps = [ip for ip in vtep_ips.values() if ip != local_vtep_ip]
+
+        logger.info(
+            f"Verifying {rname} (local VTEP: {local_vtep_ip}) - "
+            f"expects RMACs from {len(expected_remote_vteps)} remote VTEPs"
+        )
+
+        # Use library function to check L3VNI RMACs
+        # Increased timeout for certain system where bridge FDB sync may be slower
+        test_func = partial(
+            evpn_verify_l3vni_rmacs, router, l3vni_list, expected_remote_vteps
+        )
+        _, result = topotest.run_and_expect(test_func, None, count=70, wait=1)
+        assert result is None, f"{rname} L3VNI RMAC verification failed: {result}"
+
+
+def get_remote_macs(dut, vni):
+    """
+    Return remote router-MACs zebra has learned for one L3VNI.
+
+    Runs `show evpn rmac vni <vni> json` and collects the MAC address keys.
+
+    Parameters
+    ----------
+    dut : router
+        Device under test.
+    vni : str or int
+        L3VNI to query.
+
+    Returns
+    -------
+    list of str
+        Sorted lowercase MAC addresses. Empty when zebra has no remote RMACs
+        or the command returns no JSON.
+    """
+    output = dut.vtysh_cmd(f"show evpn rmac vni {vni} json", isjson=True)
+    if not isinstance(output, dict):
+        logger.error(
+            f"{dut.name}: no JSON from 'show evpn rmac vni {vni} json' "
+            f"(got {type(output).__name__})"
+        )
+        return []
+
+    macs = []
+    for key, value in output.items():
+        if not isinstance(value, dict) or ":" not in key:
+            continue
+        macs.append(key.lower())
+
+    macs = sorted(set(macs))
+    if macs:
+        logger.info(f"{dut.name}: VNI {vni} remote RMACs: {macs}")
+    else:
+        logger.error(f"{dut.name}: VNI {vni} has no remote RMACs: {output}")
+    return macs
+
+
+def get_l3vni_bridge_vlan(dut, vni):
+    """
+    Return the bridge, VXLAN device, and access VLAN for one L3VNI.
+
+    Reads `show evpn vni <vni> json`. The bridge row zebra reinstalls is
+    specific to this VLAN. Two L3VNIs on one bridge use different VLANs, and
+    a remote VTEP can advertise the same router-MAC for both.
+
+    Parameters
+    ----------
+    dut : router
+        Device under test.
+    vni : str or int
+        L3VNI to query.
+
+    Returns
+    -------
+    tuple of (str, str, int)
+        Bridge name, VXLAN device name, and access VLAN id. VLAN 0 means
+        the bridge is not VLAN-aware, which is the usual per-VNI device.
+
+    Raises
+    ------
+    RuntimeError
+        When the VNI is missing, is not an L3VNI, or has no bridge, VXLAN
+        device, or VLAN.
+    """
+    raw = dut.vtysh_cmd(f"show evpn vni {vni} json", isjson=True)
+    info = _evpn_normalize_vni_json(raw, int(vni))
+    if not isinstance(info, dict) or not info:
+        raise RuntimeError(f"{dut.name}: no JSON from 'show evpn vni {vni} json'")
+
+    vni_type = info.get("type")
+    if vni_type not in (None, "L3"):
+        raise RuntimeError(f"{dut.name}: VNI {vni} is type {vni_type}, expected L3")
+
+    bridge = info.get("bridge")
+    if not bridge or bridge == "-":
+        raise RuntimeError(f"{dut.name}: VNI {vni} has no L3VNI bridge: {info}")
+
+    vxlan = info.get("vxlanIntf") or info.get("vxlanIf") or info.get("vxlanInterface")
+    if not vxlan or vxlan == "-":
+        raise RuntimeError(f"{dut.name}: VNI {vni} has no VXLAN device: {info}")
+
+    try:
+        vlan = int(info.get("vlan"))
+    except (TypeError, ValueError):
+        raise RuntimeError(
+            f"{dut.name}: VNI {vni} has no access VLAN: {info}"
+        ) from None
+    if vlan < 0:
+        raise RuntimeError(f"{dut.name}: VNI {vni} has no access VLAN: {info}")
+
+    logger.info(f"{dut.name}: VNI {vni} L3VNI bridge {bridge} dev {vxlan} vlan {vlan}")
+    return bridge, vxlan, vlan
+
+
+def bridge_fdb_flush_cmd(bridge, vlan=0):
+    """
+    Return a `bridge fdb flush dev <bridge> [vlan <vid>]` command.
+
+    A non-zero VLAN limits the flush to that VLAN. VLAN 0 flushes the whole
+    bridge device.
+    """
+    if vlan:
+        return f"bridge fdb flush dev {bridge} vlan {int(vlan)}"
+    return f"bridge fdb flush dev {bridge}"
+
+
+# Words that follow the NTF_MASTER flag. A later "master <bridge>" is the
+# bridge device from NDA_MASTER, not another flag.
+_FDB_FLAG_OR_STATE = {
+    "self",
+    "router",
+    "extern_learn",
+    "offload",
+    "master",
+    "sticky",
+    "permanent",
+    "static",
+    "stale",
+    "dynamic",
+    "reachable",
+}
+
+
+def _fdb_token(parts, key):
+    """Return the token after `key`, or None."""
+    for index, part in enumerate(parts[:-1]):
+        if part == key:
+            return parts[index + 1]
+    return None
+
+
+def _fdb_bridge_names(parts):
+    """Bridge device names printed as `master <bridge>`."""
+    names = []
+    for index, part in enumerate(parts[:-1]):
+        name = parts[index + 1]
+        if part != "master":
+            continue
+        if name in _FDB_FLAG_OR_STATE or name.startswith("state="):
+            continue
+        names.append(name)
+    return names
+
+
+def _fdb_show_cmd(bridge, vxlan, vlan, mac=None):
+    """
+    `bridge fdb show` limited to one bridge, VXLAN port, and VLAN.
+
+    `dev` is the bridge port. `br` is the bridge. A MAC-only grep also
+    matches the same router-MAC on the other L3VNI VLAN.
+    """
+    cmd = (
+        "bridge fdb show"
+        f" br {shlex.quote(str(bridge))}"
+        f" dev {shlex.quote(str(vxlan))}"
+    )
+    # VLAN 0 is a non-VLAN-aware bridge. `vlan 0` is not a filter.
+    if int(vlan):
+        cmd += f" vlan {int(vlan)}"
+    if mac:
+        cmd += f" | grep -i -F -- {shlex.quote(mac)} || true"
+    return cmd
+
+
+def _fdb_line_programs_mac(line, mac, bridge, vxlan, vlan):
+    """
+    True when this line is the bridge FDB row for `mac` on this target.
+
+    The row zebra reinstalls is the master entry on the L3VNI VXLAN port
+    and access VLAN. A vxlan self entry (`dst`, no master) survives
+    `bridge fdb flush dev <bridge>` and is not that row. The same MAC on
+    another VLAN is a different L3VNI and does not count.
+
+    `bridge fdb show dev <vxlan>` omits `dev <vxlan>` from each line because
+    that port is already the filter. An unfiltered line still has to name it.
+    """
+    parts = line.lower().split()
+    if not parts or parts[0] != mac.lower():
+        return False
+    # `bridge fdb show dev vxlan48` omits the port it was given:
+    #   06:4f:aa:dc:52:5a vlan 4001 extern_learn master br_default
+    # Unfiltered `bridge fdb show` prints it:
+    #   06:4f:aa:dc:52:5a dev vxlan48 vlan 4001 extern_learn master br_default
+    # A missing dev was already limited to this vxlan. A printed dev must match.
+    got_dev = _fdb_token(parts, "dev")
+    if got_dev is not None and got_dev != str(vxlan).lower():
+        return False
+    got_vlan = _fdb_token(parts, "vlan")
+    if int(vlan):
+        if got_vlan != str(int(vlan)):
+            return False
+    elif got_vlan is not None:
+        return False
+    if "master" not in parts:
+        return False
+    bridge_names = _fdb_bridge_names(parts)
+    if bridge_names and str(bridge).lower() not in bridge_names:
+        return False
+    return True
+
+
+def check_mac_in_fdb(dut, mac, bridge, vxlan, vlan):
+    """
+    Return True when this bridge, VXLAN device, and VLAN program `mac`.
+
+    Runs `bridge fdb show br <bridge> dev <vxlan> vlan <vlan>` and keeps
+    the master row for that port and VLAN.
+
+    Parameters
+    ----------
+    dut : router
+        Device under test.
+    mac : str
+        MAC address to look up.
+    bridge : str
+        Bridge device, for example ``br_default``.
+    vxlan : str
+        VXLAN port enslaved to `bridge`.
+    vlan : int
+        Access VLAN of the L3VNI.
+
+    Returns
+    -------
+    bool
+        True when that bridge row is present.
+    """
+    cmd = _fdb_show_cmd(bridge, vxlan, vlan, mac)
+    output = dut.run(cmd)
+    if not output or not str(output).strip():
+        logger.debug(
+            f"{dut.name}: no bridge FDB row for {mac} "
+            f"on {bridge} dev {vxlan} vlan {vlan}"
+        )
+        return False
+
+    for line in str(output).splitlines():
+        if _fdb_line_programs_mac(line, mac, bridge, vxlan, vlan):
+            logger.debug(
+                f"{dut.name}: bridge FDB has {mac} on {bridge} "
+                f"dev {vxlan} vlan {vlan}: {line.strip()}"
+            )
+            return True
+
+    logger.info(
+        f"{dut.name}: no bridge row for {mac} on {bridge} "
+        f"dev {vxlan} vlan {vlan}:\n{output.strip()}"
+    )
+    return False
+
+
+def get_macs_in_bridge_fdb(dut, macs, bridge, vxlan, vlan):
+    """
+    Return which router-MACs have a bridge row on this VLAN.
+
+    Reads `bridge fdb show br <bridge> dev <vxlan> vlan <vlan>` once.
+    A row for the same MAC on a different VLAN is not counted.
+
+    Parameters
+    ----------
+    dut : router
+        Device under test.
+    macs : list of str
+        Router-MAC addresses to look for.
+    bridge : str
+        Bridge device, for example ``br_default``.
+    vxlan : str
+        VXLAN port enslaved to `bridge`.
+    vlan : int
+        Access VLAN of the L3VNI.
+
+    Returns
+    -------
+    tuple of (list of str, list of str)
+        MACs from `macs` that have a matching bridge row, and those lines.
+    """
+    output = dut.run(_fdb_show_cmd(bridge, vxlan, vlan))
+    text = "" if output is None else str(output)
+    present = []
+    lines = []
+    for mac in macs:
+        matched = [
+            line.strip()
+            for line in text.splitlines()
+            if line.strip() and _fdb_line_programs_mac(line, mac, bridge, vxlan, vlan)
+        ]
+        if matched:
+            present.append(mac)
+            lines.extend(matched)
+    return present, lines
+
+
+def flush_bridge_fdb(dut, bridge_dev):
+    """
+    Flush FDB entries on a bridge device.
+
+    Runs `bridge fdb flush dev <bridge_dev>` and deletes that bridge's FDB
+    entries. It does not read or return MAC rows. Callers use
+    `required_iproute2_version("5.19")` before calling this helper.
+
+    Parameters
+    ----------
+    dut : router
+        Device under test.
+    bridge_dev : str
+        Bridge interface name, for example the L3VNI bridge.
+
+    Returns
+    -------
+    str
+        The command that was run.
+
+    Raises
+    ------
+    CalledProcessError
+        When the flush command fails.
+    """
+    cmd = bridge_fdb_flush_cmd(bridge_dev)
+    logger.info(f"{dut.name}: {cmd}")
+    try:
+        dut.cmd_raises(cmd)
+    except Exception as exc:
+        logger.error(f"{dut.name}: '{cmd}' failed: {exc}")
+        raise
+    return cmd
+
+
+def evpn_trigger_host_arp(tgen, host_gateways, interface="swp1", count=3, interval=1):
+    """
+    Trigger ARP/NDP from hosts to populate MAC address tables in the EVPN fabric.
+
+    This sends gratuitous ARP requests from each host to their default gateway,
+    ensuring MAC addresses are learned by the VTEPs. This is useful for triggering
+    EVPN Type-2 (MAC/IP) route advertisement.
+
+    Parameters
+    ----------
+    * `tgen`: Topogen object
+    * `host_gateways`: dict mapping host router names to their gateway IP addresses
+                       e.g., {"host-111": "60.1.1.11", "host-211": "60.1.1.21"}
+    * `interface`: interface name to send ARP requests from (default: "swp1")
+    * `count`: number of ARP requests to send per host (default: 3)
+    * `interval`: interval in seconds between ARP requests (default: 1)
+
+    Returns
+    -------
+    None
+
+    Usage
+    -----
+    from lib.evpn import evpn_trigger_host_arp
+
+    host_gateways = {
+        "host-111": "60.1.1.11",
+        "host-112": "60.1.1.11",
+        "host-211": "60.1.1.21",
+        "host-221": "60.1.1.22",
+    }
+
+    # Using default interface (swp1)
+    evpn_trigger_host_arp(tgen, host_gateways)
+
+    # Using custom interface
+    evpn_trigger_host_arp(tgen, host_gateways, interface="eth0")
+
+    # Custom count and interval
+    evpn_trigger_host_arp(tgen, host_gateways, interface="swp1", count=5, interval=2)
+    """
+    from time import sleep
+
+    for hostname, gateway_ip in host_gateways.items():
+        if hostname not in tgen.gears:
+            logger.info(f"{hostname}: Router not found, skipping ARP trigger")
+            continue
+
+        host = tgen.gears[hostname]
+        logger.info(
+            f"{hostname}: Sending {count} ARP requests to {gateway_ip} on {interface}"
+        )
+
+        # Send ARP requests with specified interval (similar to ssim3 post-up)
+        # arping -q: quiet mode, -c 1: count 1 packet, -w 1: timeout 1 sec, -I: interface
+        for i in range(1, count + 1):
+            cmd = f"arping -q -c 1 -w 1 -I {interface} {gateway_ip}"
+            host.run(cmd)
+            if i < count:  # Don't sleep after the last iteration
+                sleep(interval)
+
+
+#
+#
+#
+def evpn_check_bgp_imet(dut, rd, prefix, pmsi_label, pmsi_id):
+    """
+    Return error if the type-3 PMSI attr label or ID don't match the inputs
+    """
+    rd_routes_json = dut.vtysh_cmd(f"show bgp l2vpn evpn route rd {rd} type 3 json")
+    rd_routes = json.loads(rd_routes_json)
+
+    if not rd_routes:
+        return "Imet routes not found"
+
+    if rd not in rd_routes or prefix not in rd_routes[rd]:
+        return f"Imet routes not found for rd {rd} and {prefix}"
+    paths = rd_routes[rd][prefix]["paths"]
+    if not len(paths):
+        return f"Imet route paths routes not found for rd {rd} and {prefix}"
+    out_label = paths[0][0]["pmsi"].get("label", 0)
+    if out_label != pmsi_label:
+        return f"Imet PMSI Label mismatch Expected {pmsi_label} Got {out_label}"
+
+    out_id = paths[0][0]["pmsi"].get("id", "")
+    if out_id != pmsi_id:
+        return f"Imet PMSI Id mismatch Expected {pmsi_id} Got {out_id}"
+    return None
+
+
+def evpn_trigger_arp_scapy(tgen, host_gateways, interface="swp1"):
+    """
+    Trigger ARP using Scapy to populate MAC address tables in the EVPN fabric.
+
+    This function uses Scapy to craft and send ARP requests, providing more
+    flexibility for complex scenarios like anycast gateway testing or custom
+    packet crafting. This is particularly useful when testing scenarios that
+    require specific MAC addresses or when arping utility is not available.
+
+    Parameters
+    ----------
+    * `tgen`: Topogen object
+    * `host_gateways`: dict mapping host router names to their gateway IP addresses
+                       e.g., {"host-111": "60.1.1.11", "host-211": "60.1.1.21"}
+    * `interface`: interface name to send ARP requests from (default: "swp1")
+
+    Returns
+    -------
+    None
+
+    Usage
+    -----
+    from lib.evpn import evpn_trigger_arp_scapy
+
+    host_gateways = {
+        "host-111": "60.1.1.11",
+        "host-112": "60.1.1.11",
+        "host-211": "60.1.1.21",
+        "host-221": "60.1.1.22",
+    }
+
+    # Using default interface (swp1)
+    evpn_trigger_arp_scapy(tgen, host_gateways)
+
+    # Using custom interface
+    evpn_trigger_arp_scapy(tgen, host_gateways, interface="eth0")
+
+    Notes
+    -----
+    - Requires Scapy to be installed on the system
+    - Uses the scapy_sendpkt.py helper script from lib/
+    - More powerful than arping for custom packet crafting
+    - Better for anycast gateway testing where specific MAC addresses are needed
+    """
+    import os
+    import subprocess
+
+    # Get path to scapy_sendpkt.py script
+    lib_dir = os.path.dirname(os.path.abspath(__file__))
+    script_path = os.path.join(lib_dir, "scapy_sendpkt.py")
+
+    if not os.path.exists(script_path):
+        logger.error(f"scapy_sendpkt.py not found at {script_path}")
+        return
+
+    # Get python3 executable path
+    python3_path = tgen.net.get_exec_path(["python3", "python"])
+
+    for hostname, gateway_ip in host_gateways.items():
+        if hostname not in tgen.gears:
+            logger.info(f"{hostname}: Router not found, skipping ARP trigger")
+            continue
+
+        host = tgen.net.hosts[hostname]
+        logger.info(
+            f"{hostname}: Sending ARP request to {gateway_ip} on {interface} using Scapy"
+        )
+
+        # Craft ARP packet using Scapy
+        # Ether(dst="ff:ff:ff:ff:ff:ff") = broadcast Ethernet frame
+        # ARP(pdst="<gateway_ip>") = ARP request for gateway IP
+        ping_cmd = [
+            python3_path,
+            script_path,
+            "--imports=Ether,ARP",
+            "--interface=" + interface,
+            f'Ether(dst="ff:ff:ff:ff:ff:ff")/ARP(pdst="{gateway_ip}")',
+        ]
+
+        try:
+            _, stdout, _ = host.cmd_status(
+                ping_cmd, warn=False, stderr=subprocess.STDOUT
+            )
+            stdout = stdout.strip()
+            if stdout:
+                logger.debug(
+                    f"{hostname}: Scapy ARP on {interface} for {gateway_ip} returned: {stdout}"
+                )
+        except Exception as e:
+            logger.warning(
+                f"{hostname}: Failed to send ARP via Scapy to {gateway_ip}: {e}"
+            )
+
+
+def evpn_verify_ping_connectivity(
+    router=None,
+    dest_ip=None,
+    source_ip=None,
+    count=4,
+    timeout=10,
+    tgen=None,
+    source_host=None,
+):
+    """
+    Test ping connectivity between hosts/routers in EVPN topology.
+
+    This function tests reachability with strict success criteria (0% packet loss).
+    Automatically detects IPv4 vs IPv6 and uses appropriate ping command.
+    Designed to work with topotest.run_and_expect for retry logic.
+
+    Parameters
+    ----------
+    * `router`: Router object to ping from (if None, source_host and tgen must be provided)
+    * `dest_ip`: Destination IP address (IPv4 or IPv6) - REQUIRED
+    * `source_ip`: Optional source IP address or interface name for -I flag
+    * `count`: Number of ping packets to send (default: 4)
+    * `timeout`: Timeout in seconds per packet (default: 10)
+    * `tgen`: Topogen object (required if router is None)
+    * `source_host`: Source host/router name (used with tgen if router is None)
+
+    Returns
+    -------
+    None on success (0% packet loss), error string on failure
+
+    Usage
+    -----
+    **Example 1: Using router object directly**
+    ```python
+    from functools import partial
+    from lib import topotest
+    from lib.evpn import evpn_verify_ping_connectivity
+
+    router = tgen.gears["host-211"]
+    test_func = partial(
+        evpn_verify_ping_connectivity,
+        router=router,
+        dest_ip="60.1.1.111",
+        source_ip="60.1.1.211",
+        count=4
+    )
+    _, result = topotest.run_and_expect(test_func, None, count=10, wait=1)
+    assert result is None, f"Ping failed: {result}"
+    ```
+
+    **Example 2: Using tgen + source_host**
+    ```python
+    test_func = partial(
+        evpn_verify_ping_connectivity,
+        tgen=tgen,
+        source_host="host-211",
+        dest_ip="60.1.1.111",
+        source_ip="60.1.1.211"
+    )
+    _, result = topotest.run_and_expect(test_func, None, count=10, wait=1)
+    assert result is None, f"Ping failed: {result}"
+    ```
+
+    **Example 3: IPv6 connectivity**
+    ```python
+    result = evpn_verify_ping_connectivity(
+        router=host_router,
+        dest_ip="2060:1:1:1::111",
+        source_ip="2060:1:1:1::211",
+        count=4
+    )
+    if result:
+        logger.error(f"IPv6 ping failed: {result}")
+    ```
+
+    **Example 4: Quick inline test (not recommended for flaky networks)**
+    ```python
+    # Direct call without retry logic
+    result = evpn_verify_ping_connectivity(
+        tgen=tgen,
+        source_host="host-211",
+        dest_ip="60.1.1.111"
+    )
+    assert result is None, result
+    ```
+    """
+    import re
+    import ipaddress
+
+    # Parameter validation
+    if dest_ip is None:
+        return "dest_ip parameter is required"
+
+    # Get router object
+    if router is None:
+        if tgen is None or source_host is None:
+            return "Either 'router' or both 'tgen' and 'source_host' must be provided"
+        if source_host not in tgen.gears:
+            return f"Source host '{source_host}' not found in topology"
+        router = tgen.gears[source_host]
+        router_name = source_host
+    else:
+        router_name = router.name
+
+    # Auto-detect IPv4 vs IPv6
+    is_ipv6 = False
+    try:
+        ipaddress.IPv6Address(dest_ip)
+        is_ipv6 = True
+    except ipaddress.AddressValueError:
+        try:
+            ipaddress.IPv4Address(dest_ip)
+            is_ipv6 = False
+        except ipaddress.AddressValueError:
+            return f"Invalid IP address: {dest_ip}"
+
+    # Build ping command
+    if is_ipv6:
+        cmd = f"ping6 -c {count} -W {timeout}"
+    else:
+        cmd = f"ping -c {count} -W {timeout}"
+
+    # Add source IP/interface if specified
+    if source_ip:
+        cmd += f" -I {source_ip}"
+
+    # Add destination
+    cmd += f" {dest_ip}"
+
+    # Log the test
+    log_msg = f"{router_name}: Testing connectivity to {dest_ip}"
+    if source_ip:
+        log_msg += f" from {source_ip}"
+    logger.info(log_msg)
+    logger.debug(f"{router_name}: Executing: {cmd}")
+
+    # Execute ping
+    try:
+        output = router.run(cmd)
+    except Exception as e:
+        return f"{router_name}: Failed to execute ping command: {e}"
+
+    logger.debug(f"{router_name}: Ping output:\n{output}")
+
+    # Parse ping output for packet statistics
+    # Format: "X packets transmitted, Y received, Z% packet loss"
+    match = re.search(r"(\d+) packets transmitted, (\d+) received", output)
+
+    if not match:
+        return (
+            f"{router_name}: Failed to parse ping output to {dest_ip}\n"
+            f"Output: {output[:200]}"  # Limit output in error message
+        )
+
+    transmitted = int(match.group(1))
+    received = int(match.group(2))
+
+    # Validate packet transmission
+    if transmitted == 0:
+        return f"{router_name}: No packets transmitted to {dest_ip}"
+
+    # Check for packet loss
+    if received != transmitted:
+        packet_loss_pct = ((transmitted - received) / transmitted) * 100
+        return (
+            f"{router_name}: Ping to {dest_ip} failed - "
+            f"{transmitted} transmitted, {received} received, "
+            f"{packet_loss_pct:.1f}% packet loss (expected 0%)"
+        )
+
+    # Success
+    logger.info(
+        f"{router_name}: Ping to {dest_ip} SUCCESS - "
+        f"{transmitted} packets transmitted, {received} received, 0% packet loss"
+    )
+    return None
+
+
+def evpn_verify_vrf_rib_route(router, vrf, route, expected_json):
+    """
+    Helper function to verify a specific route in a VRF RIB (Routing Information Base).
+
+    This function queries 'show ip route vrf {vrf} {route} json' and compares
+    the output against expected JSON structure using topotest.json_cmp().
+
+    Parameters
+    ----------
+    * `router`: router object to check
+    * `vrf`: VRF name (e.g., "vrf1", "vrf2")
+    * `route`: Route prefix to verify (e.g., "81.1.1.0/24", "2081:1:1:1::/64")
+    * `expected_json`: Expected JSON structure to compare against
+
+    Returns
+    -------
+    None on success, error string on failure (for use with topotest.run_and_expect)
+
+    Usage
+    -----
+    from functools import partial
+    from lib import topotest
+    from lib.evpn import evpn_verify_vrf_rib_route
+
+    # Verify EVPN Type-5 route with simplified fields (partial matching)
+    expected = {
+        "81.1.1.0/24": [
+            {
+                "protocol": "bgp",
+                "vrfName": "vrf1",
+                "selected": True,
+                "installed": True
+            }
+        ]
+    }
+
+    test_func = partial(
+        evpn_verify_vrf_rib_route,
+        router,
+        vrf="vrf1",
+        route="81.1.1.0/24",
+        expected_json=expected
+    )
+    _, result = topotest.run_and_expect(test_func, None, count=30, wait=1)
+    assert result is None, f"VRF RIB route verification failed: {result}"
+    """
+    from lib import topotest
+
+    # Determine if this is IPv6 based on route format
+    is_ipv6 = ":" in route
+    cmd = f"show {'ipv6' if is_ipv6 else 'ip'} route vrf {vrf} {route} json"
+
+    # Execute command
+    output = router.vtysh_cmd(cmd, isjson=True)
+
+    if not output:
+        return f"VRF {vrf}: No output from '{cmd}'"
+
+    if not isinstance(output, dict):
+        return (
+            f"VRF {vrf}: Invalid output format from '{cmd}', "
+            f"expected dict, got {type(output)}"
+        )
+
+    # Compare actual output with expected JSON
+    result = topotest.json_cmp(output, expected_json)
+
+    if result is not None:
+        return (
+            f"VRF {vrf}: Route {route} mismatch.\n"
+            f"Expected: {expected_json}\n"
+            f"Actual: {output}\n"
+            f"Diff: {result}"
+        )
+
+    logger.info(f"{router.name}: VRF {vrf} route {route} matches expected structure")
+    return None
+
+
+def evpn_verify_overlay_route_in_kernel(
+    router, vrf, route, expected_nexthops, expected_dev="vlan4001"
+):
+    """
+    Verify EVPN overlay route in Linux kernel routing table with nexthop groups.
+
+    This function validates that an overlay route exists in the kernel with correct
+    nexthop group configuration using Linux 'ip' commands with JSON output.
+
+    Validates:
+    - Route exists with nexthop group ID (nhid)
+    - Nexthop group contains expected individual nexthops
+    - Each nexthop has correct gateway IP
+    - Each nexthop uses correct output device
+    - Each nexthop has 'onlink' flag set
+
+    Parameters
+    ----------
+    * `router`: router object to check
+    * `vrf`: VRF name (e.g., "vrf1", "vrf2")
+    * `route`: Route prefix to verify (e.g., "81.1.1.0/24", "2081:1:1:1::/64")
+    * `expected_nexthops`: List of expected nexthop IPs (can be IPv4 or IPv6)
+    * `expected_dev`: Expected output device (default: "vlan4001")
+
+    Returns
+    -------
+    None on success, error string on failure (for use with topotest.run_and_expect)
+
+    Usage
+    -----
+    from functools import partial
+    from lib import topotest
+    from lib.evpn import evpn_verify_overlay_route_in_kernel
+
+    # Verify EVPN Type-5 route with IPv4 overlay and IPv6 nexthops
+    expected_nexthops = ["2006:20:20::1", "2006:20:20::2"]
+
+    test_func = partial(
+        evpn_verify_overlay_route_in_kernel,
+        router,
+        vrf="vrf1",
+        route="81.1.1.0/24",
+        expected_nexthops=expected_nexthops,
+        expected_dev="vlan4001"
+    )
+    _, result = topotest.run_and_expect(test_func, None, count=30, wait=1)
+    assert result is None, f"Kernel route verification failed: {result}"
+
+    Notes
+    -----
+    Uses Linux commands with JSON output:
+    - ip -j route show vrf {vrf} {route}
+    - ip -j nexthop get id {nhid}
+
+    Example JSON outputs:
+
+    Route query:
+    [{"dst":"81.1.1.0/24","nhid":185,"protocol":"bgp","metric":20,"flags":[]}]
+
+    Nexthop group query:
+    [{"id":185,"group":[{"id":178},{"id":181}],"protocol":"zebra","flags":[]}]
+
+    Individual nexthop queries:
+    [{"id":178,"gateway":"2006:20:20::1","dev":"vlan4001","scope":"link","protocol":"zebra","flags":["onlink"]}]
+    [{"id":181,"gateway":"2006:20:20::2","dev":"vlan4001","scope":"link","protocol":"zebra","flags":["onlink"]}]
+    """
+    import json
+
+    # Step 1: Get route information with JSON output
+    cmd = f"ip -j route show vrf {vrf} {route}"
+    output = router.run(cmd)
+
+    if not output or not output.strip():
+        return f"VRF {vrf}: No kernel route found for '{cmd}'"
+
+    try:
+        route_data = json.loads(output)
+    except json.JSONDecodeError as e:
+        return (
+            f"VRF {vrf}: Failed to parse JSON from '{cmd}'.\n"
+            f"Error: {e}\nOutput: {output}"
+        )
+
+    if not route_data or not isinstance(route_data, list) or len(route_data) == 0:
+        return f"VRF {vrf}: Route {route} not found in kernel"
+
+    # Step 2: Extract nhid (nexthop group ID) from route
+    route_entry = route_data[0]
+    nhid = route_entry.get("nhid")
+
+    if nhid is None:
+        return (
+            f"VRF {vrf}: Route {route} found but has no 'nhid' field.\n"
+            f"Route data: {route_entry}"
+        )
+
+    logger.info(f"{router.name}: Route {route} has nexthop group ID: {nhid}")
+
+    # Step 3: Get nexthop group details
+    cmd = f"ip -j nexthop get id {nhid}"
+    output = router.run(cmd)
+
+    if not output or not output.strip():
+        return f"VRF {vrf}: Failed to get nexthop group {nhid}"
+
+    try:
+        nh_group_data = json.loads(output)
+    except json.JSONDecodeError as e:
+        return (
+            f"VRF {vrf}: Failed to parse JSON from '{cmd}'.\n"
+            f"Error: {e}\nOutput: {output}"
+        )
+
+    if not nh_group_data or not isinstance(nh_group_data, list):
+        return f"VRF {vrf}: Invalid nexthop group data for ID {nhid}"
+
+    # Step 4: Extract individual nexthop IDs from group
+    nh_group_entry = nh_group_data[0]
+    group_members = nh_group_entry.get("group")
+
+    if not group_members:
+        return (
+            f"VRF {vrf}: Nexthop ID {nhid} has no 'group' field.\n"
+            f"Data: {nh_group_entry}"
+        )
+
+    # Extract individual nexthop IDs
+    nh_ids = [member["id"] for member in group_members if "id" in member]
+
+    logger.info(
+        f"{router.name}: Nexthop group {nhid} contains {len(nh_ids)} members: {nh_ids}"
+    )
+
+    # Step 5: Query each individual nexthop and extract gateway IP
+    actual_nexthops = []
+    for nh_id in nh_ids:
+        cmd = f"ip -j nexthop get id {nh_id}"
+        output = router.run(cmd)
+
+        if not output or not output.strip():
+            return f"VRF {vrf}: Failed to get nexthop details for ID {nh_id}"
+
+        try:
+            nh_data = json.loads(output)
+        except json.JSONDecodeError as e:
+            return (
+                f"VRF {vrf}: Failed to parse JSON from '{cmd}'.\n"
+                f"Error: {e}\nOutput: {output}"
+            )
+
+        if not nh_data or not isinstance(nh_data, list):
+            return f"VRF {vrf}: Invalid nexthop data for ID {nh_id}"
+
+        nh_entry = nh_data[0]
+        nexthop_ip = nh_entry.get("gateway")
+        nexthop_dev = nh_entry.get("dev")
+        nexthop_flags = nh_entry.get("flags", [])
+
+        if not nexthop_ip:
+            return (
+                f"VRF {vrf}: Nexthop ID {nh_id} has no 'gateway' field.\n"
+                f"Data: {nh_entry}"
+            )
+
+        actual_nexthops.append(nexthop_ip)
+
+        logger.info(
+            f"{router.name}: Nexthop ID {nh_id}: gateway {nexthop_ip} dev {nexthop_dev} "
+            f"flags {nexthop_flags}"
+        )
+
+        # Verify device if expected
+        if expected_dev and nexthop_dev != expected_dev:
+            return (
+                f"VRF {vrf}: Nexthop {nexthop_ip} uses device '{nexthop_dev}', "
+                f"expected '{expected_dev}'"
+            )
+
+        # Verify onlink flag is set
+        if "onlink" not in nexthop_flags:
+            return (
+                f"VRF {vrf}: Nexthop {nexthop_ip} (ID {nh_id}) missing 'onlink' flag.\n"
+                f"Flags: {nexthop_flags}"
+            )
+
+    # Step 6: Compare actual nexthops with expected
+    # Convert to sets for comparison (order doesn't matter)
+    actual_set = set(actual_nexthops)
+    expected_set = set(expected_nexthops)
+
+    if actual_set != expected_set:
+        missing = expected_set - actual_set
+        extra = actual_set - expected_set
+        error_msg = f"VRF {vrf}: Route {route} nexthop mismatch.\n"
+        if missing:
+            error_msg += f"  Missing nexthops: {missing}\n"
+        if extra:
+            error_msg += f"  Unexpected nexthops: {extra}\n"
+        error_msg += f"  Expected: {expected_set}\n"
+        error_msg += f"  Actual: {actual_set}"
+        return error_msg
+
+    logger.info(
+        f"{router.name}: VRF {vrf} route {route} verified in kernel with "
+        f"{len(actual_nexthops)} nexthops via {expected_dev}"
+    )
+    return None
+
+
+#
+# Scale VRF EVPN route-target lists (frr-reload RTLIST packing / import map)
+#
+# Field-scale shared-services leaves use three ASNs x 512 explicit import RTs
+# (1,536 total). One matching export RT on the remote PE is enough to import
+# Type-5s; the rest of the list exists so frr-reload packs RTLIST chunks and
+# bgpd rebuilds the VRF import map once per chunk, not once per RT.
+#
+EVPN_SCALE_RT_ASNS = (60005, 60006, 65001)
+EVPN_SCALE_RT_FIRST = 102011
+EVPN_SCALE_RT_PER_ASN = 512
+
+
+def evpn_scale_rt_list(asns=None, first=None, per_asn=None, limit=None):
+    """Return explicit VRF EVPN route-target values (``ASN:local-admin``).
+
+    Default is the 1,536-entry field-scale import set. ``limit`` truncates
+    after generation so tests can keep the same first RT (the matching import)
+    while shrinking the list.
+    """
+    asns = EVPN_SCALE_RT_ASNS if asns is None else asns
+    first = EVPN_SCALE_RT_FIRST if first is None else first
+    per_asn = EVPN_SCALE_RT_PER_ASN if per_asn is None else per_asn
+    rts = [
+        "{}:{}".format(asn, value)
+        for asn in asns
+        for value in range(first, first + per_asn)
+    ]
+    if limit is not None:
+        return rts[:limit]
+    return rts
+
+
+def evpn_rt_config_lines(direction, rts, indent="  "):
+    """One ``route-target <direction> <rt>`` line per value (reload target form).
+
+    frr-reload.py packs adjacent VRF EVPN AF lines into RTLIST commands when it
+    applies this config; the target file itself stays one RT per line, matching
+    ``show running-config``.
+    """
+    return ["{}route-target {} {}".format(indent, direction, rt) for rt in rts]
+
+
+def evpn_routemap_stanza_lines(name, seqs, set_cmd="set metric"):
+    """Dummy route-map sequences so a reload can batch-delete whole clauses.
+
+    ``seqs`` is an iterable of sequence numbers. Each clause is a single
+    ``set`` so the stanza is valid and unused by forwarding.
+    """
+    lines = []
+    for seq in seqs:
+        lines.extend(
+            [
+                "route-map {} permit {}".format(name, seq),
+                " {} {}".format(set_cmd, seq),
+                "exit",
+                "!",
+            ]
+        )
+    return lines
+
+
+def evpn_type5_prefix_key(prefix):
+    """EVPN Type-5 prefix token as shown by ``show bgp l2vpn evpn route``."""
+    address, prefixlen = prefix.split("/")
+    return "[5]:[0]:[{}]:[{}]".format(prefixlen, address)
+
+
+def evpn_plumb_l3vni(router, vrf, table, vni, local_vtep):
+    """Create a VRF-lite L3VNI (bridge + VXLAN) so Type-5 can be originated.
+
+    ``local_vtep`` must already be configured on an interface. Returns None.
+    """
+    br = "br{}".format(vni)
+    vxlan = "vxlan{}".format(vni)
+    cmds = [
+        "ip link add {} type vrf table {}".format(vrf, table),
+        "ip link set dev {} up".format(vrf),
+        "ip link add {} type bridge stp_state 0".format(br),
+        "ip link set dev {} master {}".format(br, vrf),
+        "ip link set dev {} up".format(br),
+        (
+            "ip link add {} type vxlan id {} dstport 4789 local {} "
+            "nolearning".format(vxlan, vni, local_vtep)
+        ),
+        "ip link set dev {} master {}".format(vxlan, br),
+        (
+            "ip link set dev {} up type bridge_slave learning off "
+            "flood off mcast_flood off".format(vxlan)
+        ),
+    ]
+    for cmd in cmds:
+        router.cmd_raises(cmd)
+
+
+def _evpn_vni_json(router, vrf=None, vni=None):
+    """L3VNI JSON from the VRF view, else the per-VNI EVPN view."""
+    if vrf:
+        return router.vtysh_cmd("show bgp vrf {} vni json".format(vrf), isjson=True)
+    return router.vtysh_cmd("show bgp l2vpn evpn vni {} json".format(vni), isjson=True)
+
+
+def evpn_verify_vni_rt_member(router, field, rt, present=True, vrf=None, vni=None):
+    """Check that ``importRts`` / ``exportRts`` contains (or lacks) ``rt``.
+
+    Prefer ``vni=`` (``show bgp l2vpn evpn vni N json``) or ``vrf=`` for L3.
+    Returns None on success, error string on failure (for run_and_expect).
+    """
+    output = _evpn_vni_json(router, vrf=vrf, vni=vni)
+    if not output or not isinstance(output, dict):
+        return "{}: no VNI JSON for vrf={} vni={}".format(router.name, vrf, vni)
+    rts = output.get(field)
+    if rts is None and vni is not None:
+        nested = output.get(str(vni))
+        if isinstance(nested, dict):
+            rts = nested.get(field)
+    rts = rts or []
+    found = rt in rts
+    if present and not found:
+        return "{}: {} {} missing (have {})".format(router.name, field, rt, rts[:8])
+    if not present and found:
+        return "{}: {} {} still present".format(router.name, field, rt)
+    return None
+
+
+def evpn_verify_evpn_peer_established(router, peer):
+    """Return None once the L2VPN EVPN neighbor is Established."""
+    from lib.bgp import get_bgp_summary_json
+
+    output = get_bgp_summary_json(router, "l2vpn", "evpn")
+    if not output:
+        return "{}: no EVPN summary json".format(router.name)
+    peers = output.get("peers")
+    if not peers:
+        l2 = output.get("l2VpnEvpn") or output.get("l2vpnEvpn") or {}
+        peers = l2.get("peers") or {}
+    info = peers.get(peer) or {}
+    state = str(info.get("state") or info.get("peerState") or "")
+    if state.lower() != "established":
+        return "{}: EVPN peer {} state {!r}".format(router.name, peer, state)
+    return None
+
+
+def evpn_verify_type5_prefix(router, prefix, present=True):
+    """Type-5 prefix present/absent in the global EVPN table (not the VRF)."""
+    key = evpn_type5_prefix_key(prefix)
+    text = router.vtysh_cmd("show bgp l2vpn evpn route type prefix") or ""
+    found = key in text
+    if present and not found:
+        return "{}: Type-5 {} missing from EVPN table".format(router.name, prefix)
+    if not present and found:
+        return "{}: Type-5 {} still in EVPN table".format(router.name, prefix)
+    return None
+
+
+def evpn_verify_type5_prefixes(router, prefixes, present=True):
+    """All Type-5 prefixes present or absent in the EVPN table."""
+    for prefix in prefixes:
+        err = evpn_verify_type5_prefix(router, prefix, present=present)
+        if err:
+            return err
+    return None
+
+
+def evpn_verify_bgp_vrf_prefix(router, vrf, prefix, present=True, family="ipv4"):
+    """Imported (or local) unicast prefix in ``show bgp vrf`` JSON.
+
+    ``present=True`` requires at least one path that is not marked invalid.
+    ``present=False`` requires the prefix to have no such path.
+    """
+    cmd = "show bgp vrf {} {} unicast {} json".format(vrf, family, prefix)
+    output = router.vtysh_cmd(cmd, isjson=True) or {}
+    if not isinstance(output, dict):
+        output = {}
+    paths = output.get("paths") or []
+    has_valid = any(path.get("valid") is not False for path in paths)
+    if present and not has_valid:
+        return "{}: VRF {} missing BGP {} {}".format(router.name, vrf, family, prefix)
+    if not present and has_valid:
+        return "{}: VRF {} still has BGP {} {}".format(router.name, vrf, family, prefix)
+    return None
+
+
+def evpn_verify_bgp_vrf_prefixes(router, vrf, prefixes, present=True, family="ipv4"):
+    """All prefixes present or absent in the VRF BGP unicast table."""
+    for prefix in prefixes:
+        err = evpn_verify_bgp_vrf_prefix(
+            router, vrf, prefix, present=present, family=family
+        )
+        if err:
+            return err
+    return None
+
+
+def evpn_verify_vrf_route_present(router, vrf, route, protocol="bgp"):
+    """Selected route in the VRF RIB (partial JSON match)."""
+    expected = {
+        route: [
+            {
+                "protocol": protocol,
+                "selected": True,
+            }
+        ]
+    }
+    return evpn_verify_vrf_rib_route(router, vrf, route, expected)
+
+
+def evpn_verify_vrf_route_absent(router, vrf, route):
+    """Prefix gone from the VRF RIB (withdrawn after import-RT removal)."""
+    family = "ipv6" if ":" in route else "ip"
+    cmd = "show {} route vrf {} {} json".format(family, vrf, route)
+    output = router.vtysh_cmd(cmd, isjson=True) or {}
+    if not output:
+        return None
+    if isinstance(output, dict) and route in output:
+        return "{}: VRF {} still has RIB {}".format(router.name, vrf, route)
+    return None
+
+
+def evpn_verify_vrf_routes(router, vrf, prefixes, present=True, protocol="bgp"):
+    """All prefixes present or absent in the VRF RIB."""
+    for prefix in prefixes:
+        if present:
+            err = evpn_verify_vrf_route_present(router, vrf, prefix, protocol=protocol)
+        else:
+            err = evpn_verify_vrf_route_absent(router, vrf, prefix)
+        if err:
+            return err
+    return None
+
+
+def evpn_count_running_rt_lines(running_text, direction="import"):
+    """Count ``route-target <direction>`` lines in running-config text."""
+    needle = "route-target {} ".format(direction)
+    return sum(
+        1 for line in running_text.splitlines() if line.strip().startswith(needle)
+    )
+
+
+def evpn_reload_has_packed_rtlist(output, direction, rts, delete=False):
+    """True if frr-reload stdout contains a packed RTLIST for ``rts[:2]``.
+
+    Packed adds look like ``route-target import A B``; packed deletes prefix
+    ``no``. Two values are enough to prove packing (one RT per line would not
+    put both tokens on the same command).
+    """
+    if len(rts) < 2:
+        raise ValueError("need at least two RTs to detect RTLIST packing")
+    verb = "no route-target" if delete else "route-target"
+    needle = "{} {} {} {}".format(verb, direction, rts[0], rts[1])
+    return needle in output
+
+
+def evpn_verify_vrf_route_labels(
+    router, vrf, route, expected_labels=None, expected_interface=None
+):
+    """
+    Verify EVPN labels on a selected VRF route in the zebra RIB.
+
+    Parameters
+    ----------
+    * `router`: router object to check
+    * `vrf`: VRF name (e.g., "vrf1", "vrf2")
+    * `route`: Route prefix (e.g., "88.1.1.0/24")
+    * `expected_labels`: list of expected labels, or None/[] for unlabeled
+    * `expected_interface`: optional interface name that must appear on a
+      selected nexthop (e.g., "vxlan48")
+
+    Returns
+    -------
+    None on success, error string on failure (for use with topotest.run_and_expect)
+    """
+    is_ipv6 = ":" in route
+    cmd = f"show {'ipv6' if is_ipv6 else 'ip'} route vrf {vrf} {route} json"
+    output = router.vtysh_cmd(cmd, isjson=True)
+
+    if not output or route not in output:
+        return f"VRF {vrf}: route {route} not found via '{cmd}'"
+
+    routes = output[route]
+    if not isinstance(routes, list) or not routes:
+        return f"VRF {vrf}: unexpected route data for {route}: {output}"
+
+    selected = None
+    for entry in routes:
+        if entry.get("selected") or entry.get("installed"):
+            selected = entry
+            break
+    if selected is None:
+        selected = routes[0]
+
+    nexthops = selected.get("nexthops", [])
+    if not nexthops:
+        return f"VRF {vrf}: route {route} has no nexthops: {selected}"
+
+    want_labels = list(expected_labels) if expected_labels else []
+    matched = False
+    for nh in nexthops:
+        if nh.get("duplicate"):
+            continue
+        labels = nh.get("labels", [])
+        if labels != want_labels:
+            continue
+        if expected_interface and nh.get("interfaceName") != expected_interface:
+            continue
+        matched = True
+        break
+
+    if not matched:
+        return (
+            f"VRF {vrf}: route {route} label/interface mismatch.\n"
+            f"Expected labels={want_labels}"
+            f"{(' interface=' + expected_interface) if expected_interface else ''}\n"
+            f"Nexthops: {nexthops}"
+        )
+
+    logger.info(
+        "%s: VRF %s route %s has labels %s%s",
+        router.name,
+        vrf,
+        route,
+        want_labels,
+        f" via {expected_interface}" if expected_interface else "",
+    )
+    return None
+
+
+def _kernel_nh_group_ids(group):
+    """
+    Return member nexthop ids from `ip -j nexthop` group output.
+
+    Current iproute2 emits a list of objects. Older iproute2 emits a string
+    such as "10/11" or "10,1/11,2" (id,weight pairs separated by '/').
+    """
+    if isinstance(group, dict):
+        group = [group]
+    if isinstance(group, list):
+        ids = []
+        for member in group:
+            if isinstance(member, dict):
+                mid = member.get("id")
+            elif isinstance(member, int):
+                mid = member
+            elif isinstance(member, str) and member.isdigit():
+                mid = int(member)
+            else:
+                mid = None
+            if mid is not None:
+                ids.append(mid)
+        return ids
+    if isinstance(group, str):
+        ids = []
+        for member in group.split("/"):
+            id_tok = member.split(",")[0].strip()
+            if id_tok.isdigit():
+                ids.append(int(id_tok))
+        return ids
+    return []
+
+
+def _kernel_encap_id(nh_entry):
+    """Return the VXLAN/LWTUNNEL id from one `ip -j nexthop` object.
+
+    Used by evpn_verify_kernel_encap_vni() on each leaf nexthop (a group is
+    expanded to its members first). For an EVPN nexthop the tunnel id is the
+    VNI zebra encoded as LWTUNNEL_IP_ID, e.g. the D-VNI 900000. Returns None
+    when the nexthop carries no tunnel id.
+
+    iproute2 has printed this three ways:
+    - nested object: {"encap": {"type": "ip", "id": 900000}}
+    - one string: {"encap": "ip id 900000 dst 10.0.0.30"}
+    - flattened: {"encap": "ip", "id": 900000, "dst": "10.0.0.30", ...}
+      The tunnel fields sit beside the nexthop fields, and both ids use the
+      key "id". json.loads keeps the last duplicate key, so "id" is the
+      tunnel id and the nexthop id is lost.
+
+    Caveat for the flattened form: a bare "ip"/"vxlan" encap is taken to mean
+    the top-level "id" is the tunnel id. If iproute2 ever printed that encap
+    with no tunnel id, "id" would still be the nexthop id and would be
+    returned as if it were a VNI. A VNI check would then fail with a
+    misleading value instead of None.
+    """
+    encap = nh_entry.get("encap")
+    if isinstance(encap, dict):
+        encap_id = encap.get("id")
+    elif isinstance(encap, str):
+        encap_id = None
+        parts = encap.split()
+        if "id" in parts:
+            idx = parts.index("id")
+            if idx + 1 < len(parts) and parts[idx + 1].isdigit():
+                encap_id = int(parts[idx + 1])
+        elif encap in ("ip", "vxlan"):
+            encap_id = nh_entry.get("id")
+    else:
+        encap_id = None
+
+    if isinstance(encap_id, str) and encap_id.isdigit():
+        return int(encap_id)
+    return encap_id
+
+
+def evpn_verify_kernel_encap_vni(
+    router, vrf, route, expected_vni=None, expected_dev=None
+):
+    """
+    Verify Linux kernel nexthop encapsulation VNI for a VRF route.
+
+    Walks `ip -j route show` → nhid → `ip -j nexthop get` and checks
+    encap.id (LWTUNNEL_IP_ID). When expected_vni is None, asserts that no
+    EVPN/VXLAN encap id is present (unlabeled hairpin).
+
+    Parameters
+    ----------
+    * `router`: router object to check
+    * `vrf`: VRF name
+    * `route`: Route prefix
+    * `expected_vni`: D-VNI / L3VNI to expect, or None for no encap id
+    * `expected_dev`: optional output device (e.g., "vxlan48")
+
+    Returns
+    -------
+    None on success, error string on failure (for use with topotest.run_and_expect)
+    """
+    cmd = f"ip -j route show vrf {vrf} {route}"
+    output = router.run(cmd)
+    if not output or not output.strip():
+        return f"VRF {vrf}: no kernel route for '{cmd}'"
+
+    try:
+        route_data = json.loads(output)
+    except json.JSONDecodeError as e:
+        return f"VRF {vrf}: failed to parse '{cmd}': {e}; output={output}"
+
+    if not route_data:
+        return f"VRF {vrf}: route {route} not found in kernel"
+
+    route_entry = route_data[0]
+    nhid = route_entry.get("nhid")
+    if nhid is None:
+        # Some unlabeled hairpins may be installed without an nhid group.
+        if expected_vni is None:
+            encap = route_entry.get("encap") or {}
+            if encap.get("id") is not None:
+                return (
+                    f"VRF {vrf}: route {route} unexpectedly has encap id "
+                    f"{encap.get('id')}: {route_entry}"
+                )
+            logger.info(
+                "%s: VRF %s route %s has no nhid/encap (unlabeled)",
+                router.name,
+                vrf,
+                route,
+            )
+            return None
+        return f"VRF {vrf}: route {route} has no nhid: {route_entry}"
+
+    def _collect_nh_ids(nh_id, seen=None):
+        if seen is None:
+            seen = set()
+        if nh_id in seen:
+            return []
+        seen.add(nh_id)
+
+        nh_out = router.run(f"ip -j nexthop get id {nh_id}")
+        if not nh_out or not nh_out.strip():
+            return []
+        try:
+            nh_data = json.loads(nh_out)
+        except json.JSONDecodeError:
+            return []
+        if not nh_data:
+            return []
+
+        entry = nh_data[0]
+        group = entry.get("group")
+        if group:
+            return [
+                nh
+                for mid in _kernel_nh_group_ids(group)
+                for nh in _collect_nh_ids(mid, seen)
+            ]
+        return [entry]
+
+    nh_entries = _collect_nh_ids(nhid)
+    if not nh_entries:
+        return f"VRF {vrf}: failed to resolve nexthops for nhid {nhid}"
+
+    for nh_entry in nh_entries:
+        if not isinstance(nh_entry, dict):
+            return f"VRF {vrf}: unexpected nexthop entry {nh_entry!r}"
+        encap_id = _kernel_encap_id(nh_entry)
+        nh_dev = nh_entry.get("dev")
+
+        if expected_vni is None:
+            if encap_id is not None:
+                return (
+                    f"VRF {vrf}: route {route} unexpectedly has encap id "
+                    f"{encap_id} on nh {nh_entry}"
+                )
+        else:
+            if encap_id != expected_vni:
+                return (
+                    f"VRF {vrf}: route {route} encap id mismatch: "
+                    f"expected {expected_vni}, got {encap_id}; nh={nh_entry}"
+                )
+            if expected_dev and nh_dev != expected_dev:
+                return (
+                    f"VRF {vrf}: route {route} encap device mismatch: "
+                    f"expected {expected_dev}, got {nh_dev}; nh={nh_entry}"
+                )
+
+    logger.info(
+        "%s: VRF %s route %s kernel encap vni=%s%s",
+        router.name,
+        vrf,
+        route,
+        expected_vni,
+        f" via {expected_dev}" if expected_dev else "",
+    )
+    return None
+
+
+# ---------------------------------------------------------------------------
+# EVPN multihoming
+#
+# These helpers are the MH checks shared by every topotest. A suite keeps
+# only the expectations that depend on its topology (which ToRs share a rack,
+# which hosts to ping). Each helper returns None when the state matches and
+# an error string when it does not, so topotest.run_and_expect can poll it.
+#
+# The first time a check fails it is logged at info with the ES flags, VTEP
+# list, and nexthop group. The same failure on a later poll is debug, so a
+# wait does not look like a new fault. Success is debug.
+# ---------------------------------------------------------------------------
+
+_evpn_mh_last_failure = {}
+
+
+def _evpn_loads(output):
+    """Parse vtysh or ip JSON. An empty or broken reply is an empty object."""
+    if output is None or isinstance(output, (dict, list)):
+        return output if output is not None else {}
+    text = str(output).strip()
+    if not text:
+        return {}
+    try:
+        parsed = json.loads(text)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return parsed if parsed is not None else {}
+
+
+def _evpn_normalize_nexthop_ip(address):
+    """Return one comparable form of a VTEP or nexthop address.
+
+    bgpd, zebra, and ``ip -j nexthop`` do not print the same address the
+    same way. ``::ffff:192.168.100.15`` is the IPv4 VTEP ``192.168.100.15``.
+    Any other valid address is returned in canonical form, so compressed
+    and uncompressed IPv6 compare equal. An unparseable value is unchanged.
+    """
+    try:
+        parsed = ipaddress.ip_address(str(address))
+    except ValueError:
+        return address
+    if isinstance(parsed, ipaddress.IPv6Address) and parsed.ipv4_mapped:
+        mapped = str(parsed.ipv4_mapped)
+        logger.debug("nexthop %s is IPv4-mapped, comparing as %s", address, mapped)
+        return mapped
+    return str(parsed)
+
+
+def _evpn_same_addr(left, right):
+    """Compare two VTEP strings after ``_evpn_normalize_nexthop_ip``."""
+    return _evpn_normalize_nexthop_ip(left) == _evpn_normalize_nexthop_ip(right)
+
+
+def _evpn_mh_log(router, key, error, detail="", waiting=False):
+    """Log an MH check failure once at info, then at debug while it persists."""
+    if waiting:
+        logger.debug("%s: %s", router.name, error)
+        return error
+
+    slot = (getattr(router, "name", router), key)
+    if _evpn_mh_last_failure.get(slot) == error:
+        logger.debug("%s: %s", router.name, error)
+        return error
+
+    _evpn_mh_last_failure[slot] = error
+    if detail:
+        logger.info("%s: %s\n%s", router.name, error, detail)
+    else:
+        logger.info("%s: %s", router.name, error)
+    return error
+
+
+def _evpn_mh_ok(router, key, message):
+    _evpn_mh_last_failure.pop((getattr(router, "name", router), key), None)
+    logger.debug("%s: %s", router.name, message)
+    return None
+
+
+def _evpn_es_brief(es):
+    """One block a failure log can print without dumping the whole ES object."""
+    if not isinstance(es, dict) or not es:
+        return "<no ES>"
+    vteps = []
+    for vtep in es.get("vteps") or []:
+        if not isinstance(vtep, dict):
+            continue
+        vteps.append(
+            "vtep={vtep} nh={nh} dfPref={pref}".format(
+                vtep=vtep.get("vtep", vtep.get("vtep_ip")),
+                nh=vtep.get("nexthopId"),
+                pref=vtep.get("dfPreference"),
+            )
+        )
+    return "esi={esi} flags={flags} nhg={nhg} vniCount={vni}\n  {vteps}".format(
+        esi=es.get("esi"),
+        flags=es.get("flags"),
+        nhg=es.get("nexthopGroup"),
+        vni=es.get("vniCount"),
+        vteps="\n  ".join(vteps) if vteps else "<no vteps>",
+    )
+
+
+def evpn_bgp_es(router, esi):
+    """Return ``show bgp l2vpn evpn es <esi> json`` as a dict.
+
+    An unknown ESI is ``{}``. bgpd names each remote VTEP ``vtep_ip``.
+
+    Example::
+
+        es = evpn_bgp_es(torm12, "03:44:38:39:ff:ff:01:00:00:01")
+        rd = es.get("rd")
+    """
+    output = router.vtysh_cmd("show bgp l2vpn evpn es {} json".format(esi), isjson=True)
+    return output if isinstance(output, dict) else {}
+
+
+def evpn_zebra_es(router, esi):
+    """Return ``show evpn es <esi> json`` as a dict.
+
+    An unknown ESI is ``{}``. zebra names each remote VTEP ``vtep`` and
+    records the ES L2 nexthop group in ``nexthopGroup``. Per-VTEP
+    ``nexthopId`` is the FDB nexthop the kernel should hold.
+
+    Example::
+
+        es = evpn_zebra_es(torm12, esi)
+        nhg = es.get("nexthopGroup")
+    """
+    output = router.vtysh_cmd("show evpn es {} json".format(esi), isjson=True)
+    return output if isinstance(output, dict) else {}
+
+
+def _evpn_verify_es_vtep(router, esi, vtep_ip, present, source, es, key):
+    """Shared bgpd/zebra VTEP membership check. ``key`` is the JSON field."""
+    slot = "{} es {} vtep {}".format(source, esi, vtep_ip)
+    if not es:
+        if present:
+            return _evpn_mh_log(
+                router,
+                slot,
+                "{} missing ES {} while expecting VTEP {}".format(source, esi, vtep_ip),
+                waiting=True,
+            )
+        return _evpn_mh_ok(router, slot, "{} has no ES {}".format(source, esi))
+
+    found = [
+        vtep.get(key)
+        for vtep in es.get("vteps") or []
+        if isinstance(vtep, dict) and key in vtep
+    ]
+    have = any(_evpn_same_addr(ip, vtep_ip) for ip in found)
+    if have == present:
+        state = "present" if present else "absent"
+        return _evpn_mh_ok(
+            router, slot, "{} ES {} VTEP {} is {}".format(source, esi, vtep_ip, state)
+        )
+
+    expectation = "present" if present else "absent"
+    # A VTEP that has not arrived yet is a wait. One that is still listed
+    # after a withdraw is the stale-ES failure and is logged in full.
+    waiting = present and not have
+    return _evpn_mh_log(
+        router,
+        slot,
+        "{} ES {} VTEPs {}; expected {} to be {}".format(
+            source, esi, found, vtep_ip, expectation
+        ),
+        detail=_evpn_es_brief(es),
+        waiting=waiting,
+    )
+
+
+def evpn_verify_bgp_es_vtep(router, esi, vtep_ip, present=True):
+    """Check one VTEP in bgpd's ES list.
+
+    ``present=False`` succeeds when the ES itself is gone. Use this on the
+    DUT and on a live observer. When the DUT's bgpd is stopped, check the
+    observer instead.
+
+    Example::
+
+        partial(evpn_verify_bgp_es_vtep, torm12, esi, "192.168.100.15", True)
+    """
+    return _evpn_verify_es_vtep(
+        router, esi, vtep_ip, present, "bgpd", evpn_bgp_es(router, esi), "vtep_ip"
+    )
+
+
+def evpn_verify_zebra_es_vtep(router, esi, vtep_ip, present=True):
+    """Check one VTEP in zebra's ES list.
+
+    zebra keeps this list after bgpd exits unless client-close cleanup
+    removed it. A restart test reads zebra while bgpd is down.
+
+    Example::
+
+        partial(evpn_verify_zebra_es_vtep, torm12, esi, "192.168.100.15", False)
+    """
+    return _evpn_verify_es_vtep(
+        router, esi, vtep_ip, present, "zebra", evpn_zebra_es(router, esi), "vtep"
+    )
+
+
+def evpn_verify_df_role(router, esi, role):
+    """Check zebra's designated-forwarder role for one local ES.
+
+    ``role`` is ``DF`` or ``nonDF``. The flag lives in ``show evpn es``.
+    An ES with no ``nonDF`` flag is DF. This does not program the kernel;
+    pair it with ``evpn_verify_es_kernel_nexthop`` when the VTEP list changes.
+
+    Example::
+
+        partial(evpn_verify_df_role, torm12, esi, "DF")
+    """
+    es = evpn_zebra_es(router, esi)
+    slot = "df {} {}".format(esi, role)
+    if not es:
+        return _evpn_mh_log(
+            router, slot, "zebra missing ES {} for DF check".format(esi), waiting=True
+        )
+
+    flags = es.get("flags") or []
+    current = "nonDF" if "nonDF" in flags else "DF"
+    if current == role:
+        return _evpn_mh_ok(router, slot, "zebra ES {} is {}".format(esi, current))
+    return _evpn_mh_log(
+        router,
+        slot,
+        "{} is {} for {}, expected {}".format(router.name, current, esi, role),
+        detail=_evpn_es_brief(es),
+    )
+
+
+def _evpn_kernel_nh_entries(router, nh_id):
+    output = router.run("ip -j nexthop get id {}".format(nh_id)) or ""
+    parsed = _evpn_loads(output)
+    if isinstance(parsed, list):
+        return parsed
+    if isinstance(parsed, dict):
+        return [parsed]
+    return []
+
+
+def _evpn_kernel_gateways(router, nh_id, seen=None):
+    """Gateways under one nexthop id, walking group members once."""
+    seen = seen if seen is not None else set()
+    if nh_id in seen:
+        return []
+    seen.add(nh_id)
+    gateways = []
+    for entry in _evpn_kernel_nh_entries(router, nh_id):
+        group = entry.get("group")
+        if group:
+            for member in _kernel_nh_group_ids(group):
+                gateways.extend(_evpn_kernel_gateways(router, member, seen))
+            continue
+        gateway = entry.get("gateway", entry.get("via"))
+        if gateway:
+            gateways.append(str(gateway))
+    return gateways
+
+
+def evpn_verify_es_kernel_nexthop(router, esi, vtep_ip, present=True):
+    """Check the kernel FDB nexthop for one remote ES VTEP.
+
+    zebra's ``nexthopGroup`` and each VTEP ``nexthopId`` are walked with
+    ``ip -j nexthop get id``. ``present=True`` requires ``vtep_ip`` as a
+    gateway. ``present=False`` requires that gateway to be gone. An ES
+    that zebra has already freed has no kernel nexthop and counts as absent.
+
+    Example::
+
+        partial(evpn_verify_es_kernel_nexthop, torm12, esi, "192.168.100.15", False)
+    """
+    es = evpn_zebra_es(router, esi)
+    slot = "kernel es {} vtep {}".format(esi, vtep_ip)
+    if not es:
+        if present:
+            return _evpn_mh_log(
+                router,
+                slot,
+                "zebra missing ES {} while expecting kernel VTEP {}".format(
+                    esi, vtep_ip
+                ),
+                waiting=True,
+            )
+        return _evpn_mh_ok(router, slot, "kernel ES {} is gone".format(esi))
+
+    ids = []
+    nhg = es.get("nexthopGroup") or 0
+    if nhg:
+        ids.append(nhg)
+    for vtep in es.get("vteps") or []:
+        if isinstance(vtep, dict) and vtep.get("nexthopId"):
+            ids.append(vtep["nexthopId"])
+
+    if present and not ids:
+        return _evpn_mh_log(
+            router,
+            slot,
+            "zebra ES {} has no nexthop id for {}".format(esi, vtep_ip),
+            detail=_evpn_es_brief(es),
+            waiting=True,
+        )
+
+    gateways = []
+    for nh_id in ids:
+        gateways.extend(_evpn_kernel_gateways(router, nh_id))
+    have = any(_evpn_same_addr(gateway, vtep_ip) for gateway in gateways)
+    if have == present:
+        state = "present" if present else "absent"
+        return _evpn_mh_ok(
+            router, slot, "kernel ES {} VTEP {} is {}".format(esi, vtep_ip, state)
+        )
+
+    expectation = "present" if present else "absent"
+    waiting = present and not have
+    return _evpn_mh_log(
+        router,
+        slot,
+        "kernel ES {} gateways {}; expected {} to be {}".format(
+            esi, gateways, vtep_ip, expectation
+        ),
+        detail=_evpn_es_brief(es),
+        waiting=waiting,
+    )
+
+
+def evpn_verify_protodown_reason(router, reason):
+    """Check one protodown reason in ``show evpn json``.
+
+    ``reason=None`` requires the reason list to be empty. A startup-delay
+    test waits for None, then for ``uplinkDown`` after the uplinks drop.
+
+    Example::
+
+        partial(evpn_verify_protodown_reason, torm11, "uplinkDown")
+    """
+    evpn = _evpn_loads(router.vtysh_cmd("show evpn json", isjson=True))
+    if not isinstance(evpn, dict):
+        evpn = {}
+    current = evpn.get("protodownReasons") or []
+    slot = "protodown {}".format(reason)
+    if reason:
+        if reason in current:
+            return _evpn_mh_ok(router, slot, "protodown {} is set".format(reason))
+        return _evpn_mh_log(
+            router,
+            slot,
+            "protodown {} missing in {}".format(reason, current),
+            waiting=True,
+        )
+    if current:
+        return _evpn_mh_log(
+            router, slot, "unexpected protodown reasons {}".format(current)
+        )
+    return _evpn_mh_ok(router, slot, "protodown reasons are clear")
+
+
+def evpn_verify_mh_mac(router, vni, mac, mac_type, esi, intf=""):
+    """Check one EVPN MAC's ESI, local/remote type, and access interface.
+
+    The caller generates the MAC (ARP or ping) before polling. A local MAC
+    must name ``intf``. A remote MAC passes ``intf=""``.
+
+    Example::
+
+        evpn_verify_mh_mac(torm11, 1000, mac, "local", esi, "hostbond1")
+    """
+    output = router.vtysh_cmd(
+        "show evpn mac vni {} mac {} json".format(vni, mac), isjson=True
+    )
+    macs = output if isinstance(output, dict) else {}
+    slot = "mac {} vni {}".format(mac, vni)
+    for learned, info in macs.items():
+        if not isinstance(info, dict):
+            continue
+        got_type = info.get("type", "")
+        got_intf = info.get("intf", "") if got_type == "local" else ""
+        if info.get("esi", "") == esi and got_type == mac_type and got_intf == intf:
+            return _evpn_mh_ok(
+                router,
+                slot,
+                "VNI {} MAC {} is {} on ES {}".format(vni, mac, mac_type, esi),
+            )
+    return _evpn_mh_log(
+        router,
+        slot,
+        "VNI {} MAC {} expected ESI {} type {} intf {}".format(
+            vni, mac, esi, mac_type, intf or "-"
+        ),
+        detail=json.dumps(macs),
+        waiting=True,
+    )
+
+
+def evpn_verify_local_es_evi(router, esis):
+    """Check that each local ES is ready for BGP and its EVI count matches.
+
+    zebra ``vniCount`` must be non-zero and equal both bgpd ``vniCount`` and
+    the local fragment ``eviCount``. ``Ready for BGP`` is the zebra flag
+    ``readyForBgp``.
+
+    Example::
+
+        partial(evpn_verify_local_es_evi, torm11, [hostd11_esi, hostd12_esi])
+    """
+    for esi in esis:
+        zebra = evpn_zebra_es(router, esi)
+        slot = "local es-evi {}".format(esi)
+        if not zebra:
+            return _evpn_mh_log(
+                router, slot, "zebra missing local ES {}".format(esi), waiting=True
+            )
+        flags = zebra.get("flags") or []
+        if "local" not in flags:
+            return _evpn_mh_log(
+                router,
+                slot,
+                "zebra ES {} is not local: {}".format(esi, flags),
+                detail=_evpn_es_brief(zebra),
+            )
+        if "readyForBgp" not in flags:
+            return _evpn_mh_log(
+                router,
+                slot,
+                "zebra ES {} is not ready for BGP".format(esi),
+                detail=_evpn_es_brief(zebra),
+                waiting=True,
+            )
+        zebra_vnis = zebra.get("vniCount") or 0
+        if zebra_vnis == 0:
+            return _evpn_mh_log(
+                router,
+                slot,
+                "zebra ES {} has zero VNI count".format(esi),
+                detail=_evpn_es_brief(zebra),
+                waiting=True,
+            )
+
+        bgp = evpn_bgp_es(router, esi)
+        if not bgp:
+            return _evpn_mh_log(
+                router, slot, "bgpd missing local ES {}".format(esi), waiting=True
+            )
+        if "local" not in (bgp.get("type") or []):
+            return _evpn_mh_log(
+                router,
+                slot,
+                "bgpd ES {} is not local: {}".format(esi, bgp.get("type")),
+                detail=_evpn_es_brief(bgp),
+            )
+        if bgp.get("vniCount") != zebra_vnis:
+            return _evpn_mh_log(
+                router,
+                slot,
+                "ES {} VNI count mismatch: zebra {} bgpd {}".format(
+                    esi, zebra_vnis, bgp.get("vniCount")
+                ),
+                detail=_evpn_es_brief(bgp),
+            )
+
+        rd = bgp.get("rd")
+        local_frag = None
+        for frag in bgp.get("fragments") or []:
+            if isinstance(frag, dict) and frag.get("rd") == rd:
+                local_frag = frag
+                break
+        if local_frag is None:
+            return _evpn_mh_log(
+                router,
+                slot,
+                "bgpd ES {} missing local fragment {}".format(esi, rd),
+                waiting=True,
+            )
+        if local_frag.get("eviCount") != zebra_vnis:
+            return _evpn_mh_log(
+                router,
+                slot,
+                "ES {} local EVI count mismatch: zebra VNI {} bgpd local EVI {}".format(
+                    esi, zebra_vnis, local_frag.get("eviCount")
+                ),
+            )
+    return _evpn_mh_ok(router, "local es-evi", "local ES-EVI counts match")
+
+
+def evpn_verify_type4_route(
+    router, esi, originator, present=True, self_originate=False
+):
+    """Check one Type-4 Ethernet Segment route by ESI and originator IP.
+
+    ``self_originate=True`` limits the show to routes this speaker originated.
+    The command is text because the prefix line carries both the ESI and the
+    originator.
+
+    Example::
+
+        partial(evpn_verify_type4_route, torm12, esi, "192.168.100.15", True)
+    """
+    command = "show bgp l2vpn evpn route type 4"
+    if self_originate:
+        command += " self-originate"
+    output = router.vtysh_cmd(command) or ""
+    have = any(esi in line and originator in line for line in output.splitlines())
+    slot = "type4 {} {}".format(esi, originator)
+    if have == present:
+        state = "present" if present else "absent"
+        return _evpn_mh_ok(
+            router, slot, "Type-4 {} from {} is {}".format(esi, originator, state)
+        )
+    expectation = "present" if present else "absent"
+    return _evpn_mh_log(
+        router,
+        slot,
+        "Type-4 {} from {} expected {}".format(esi, originator, expectation),
+        detail=output,
+        waiting=present and not have,
+    )
+
+
+def evpn_verify_type4_origin_absent(router, address):
+    """Require that no Type-4 prefix still names ``address``.
+
+    Used after a VTEP address change. A leftover ``[4]:`` prefix that
+    contains the old address is a stale originator.
+
+    Example::
+
+        partial(evpn_verify_type4_origin_absent, torm11, "192.168.100.17")
+    """
+    output = router.vtysh_cmd("show bgp l2vpn evpn route type es json", isjson=True)
+    data = output if isinstance(output, dict) else {}
+    slot = "type4 origin {}".format(address)
+    for rd_data in data.values():
+        if not isinstance(rd_data, dict):
+            continue
+        for prefix in rd_data:
+            if str(prefix).startswith("[4]:") and address in str(prefix):
+                return _evpn_mh_log(
+                    router,
+                    slot,
+                    "Type-4 route still carries {}: {}".format(address, prefix),
+                )
+    return _evpn_mh_ok(router, slot, "no Type-4 route carries {}".format(address))
+
+
+def evpn_verify_mac_route(router, rd, mac, present=True):
+    """Check a Type-2 MAC route under one route distinguisher.
+
+    Example::
+
+        partial(evpn_verify_mac_route, torm12, rd, svi_mac, False)
+    """
+    route = _evpn_loads(
+        router.vtysh_cmd(
+            "show bgp l2vpn evpn route rd {} mac {} json".format(rd, mac), isjson=True
+        )
+    )
+    if not isinstance(route, dict):
+        route = {}
+    have = route.get("numPaths", 0) > 0
+    slot = "mac-route {} {}".format(rd, mac)
+    if have == present:
+        state = "present" if present else "absent"
+        return _evpn_mh_ok(router, slot, "MAC {} under {} is {}".format(mac, rd, state))
+    expectation = "present" if present else "absent"
+    return _evpn_mh_log(
+        router,
+        slot,
+        "MAC {} under {} expected {}".format(mac, rd, expectation),
+        detail=json.dumps(route),
+        waiting=present and not have,
+    )
+
+
+def evpn_bgp_rd_paths(router, route_type, rd, match):
+    """Return valid paths of one route type under ``rd`` whose prefix contains ``match``.
+
+    Example::
+
+        paths = evpn_bgp_rd_paths(torm12, 1, es_rd, "[4294967295]:[%s]" % esi)
+    """
+    routes = _evpn_loads(
+        router.vtysh_cmd(
+            "show bgp l2vpn evpn route type {} json".format(route_type), isjson=True
+        )
+    )
+    if not isinstance(routes, dict):
+        return []
+    paths = []
+    for prefix, info in (routes.get(rd) or {}).items():
+        if not isinstance(info, dict) or match not in prefix:
+            continue
+        for path_list in info.get("paths") or []:
+            for path in path_list if isinstance(path_list, list) else [path_list]:
+                if isinstance(path, dict) and path.get("valid"):
+                    paths.append(path)
+    logger.debug(
+        "%s: RD %s type %s match %s has %d valid paths",
+        router.name,
+        rd,
+        route_type,
+        match,
+        len(paths),
+    )
+    return paths
+
+
+def evpn_verify_bgp_es_local(router, esi, local=True):
+    """Check whether bgpd still marks the ES local.
+
+    Example::
+
+        partial(evpn_verify_bgp_es_local, torm11, esi, False)
+    """
+    es = evpn_bgp_es(router, esi)
+    have = "local" in (es.get("type") or [])
+    slot = "bgp es local {}".format(esi)
+    if have == local:
+        return _evpn_mh_ok(router, slot, "bgpd ES {} local is {}".format(esi, have))
+    return _evpn_mh_log(
+        router,
+        slot,
+        "bgpd ES {} local is {}, expected {}".format(esi, have, local),
+        detail=_evpn_es_brief(es),
+        waiting=local and not have,
+    )
+
+
+def evpn_verify_bgp_instance_absent(router, instance):
+    """Return None once ``instance`` is gone from ``show running-config bgpd``.
+
+    ``instance`` is the config line, for example ``router bgp 65002``.
+
+    Example::
+
+        partial(evpn_verify_bgp_instance_absent, torm11, "router bgp 65002")
+    """
+    output = router.vtysh_cmd("show running-config bgpd") or ""
+    slot = "bgp instance {}".format(instance)
+    if instance not in output.splitlines():
+        return _evpn_mh_ok(router, slot, "{} is absent".format(instance))
+    return _evpn_mh_log(
+        router,
+        slot,
+        "{} is still configured".format(instance),
+        detail=output,
+        waiting=True,
+    )
+
+
+#
+# EVPN multihoming: one remote MAC seen through every layer
+#
+# A remote MAC is visible in four places that must agree:
+#   BGP     - the Type-2 route and the ES's VTEP list (from Type-1 routes)
+#   zebra   - "show evpn mac" (single VTEP or ES) and "show evpn es"
+#   kernel  - the vxlan "self" FDB entry (dst <vtep> or nhid <group>) and the
+#             fdb nexthop group it points to
+# The helpers below return plain data for one layer each, so a test can
+# snapshot all of them at a given stage and compare them.
+#
+
+
+def _same_ip(left, right):
+    """True when two address strings are the same IPv4/IPv6 address."""
+    try:
+        return ipaddress.ip_address(left) == ipaddress.ip_address(right)
+    except ValueError:
+        return left == right
+
+
+def evpn_zebra_mac_entry(dut, vni, mac):
+    """
+    Return zebra's JSON entry for one MAC in one VNI, or None when absent.
+
+    The entry carries "type" (local/remote) and, for a remote MAC, either
+    "remoteVtep" (single VTEP) or "remoteEs" (behind an ES), and for an ES
+    MAC "esi".
+    """
+    out = dut.vtysh_cmd(f"show evpn mac vni {int(vni)} mac {mac} json", isjson=True)
+    if not isinstance(out, dict):
+        return None
+    for key, info in out.items():
+        if key.lower() == mac.lower() and isinstance(info, dict):
+            return info
+    return None
+
+
+def evpn_zebra_es_state(dut, esi):
+    """
+    Summarise zebra's view of one ES (`show evpn es <esi> json`).
+
+    Returns {"exists", "nhg_active", "nhg_id", "vteps", "vtep_nhids"}, where
+    vtep_nhids maps each VTEP to the nexthop id zebra gave it (the member of
+    the ES nexthop group). A remote ES that no MAC or EAD route references is
+    freed by zebra, so "exists" can be False.
+    """
+    out = dut.vtysh_cmd(f"show evpn es {esi} json", isjson=True)
+    if not isinstance(out, dict) or not out:
+        return {
+            "exists": False,
+            "nhg_active": False,
+            "nhg_id": 0,
+            "vteps": [],
+            "vtep_nhids": {},
+        }
+    return {
+        "exists": True,
+        "nhg_active": "nexthopGroupActive" in out.get("flags", []),
+        "nhg_id": out.get("nexthopGroup", 0),
+        "vteps": sorted(v.get("vtep") for v in out.get("vteps", [])),
+        "vtep_nhids": {v.get("vtep"): v.get("nexthopId") for v in out.get("vteps", [])},
+    }
+
+
+def evpn_bgp_es_vteps(dut, esi):
+    """VTEPs bgpd lists for an ES (`show bgp l2vpn evpn es <esi> json`)."""
+    out = dut.vtysh_cmd(f"show bgp l2vpn evpn es {esi} json", isjson=True)
+    if not isinstance(out, dict):
+        return []
+    return sorted(v.get("vtep_ip") for v in out.get("vteps", []))
+
+
+def _json_values_for_key(node, key, found):
+    """Collect every value stored under `key` anywhere in a JSON tree."""
+    if isinstance(node, dict):
+        for name, value in node.items():
+            if name == key:
+                found.append(value)
+            _json_values_for_key(value, key, found)
+    elif isinstance(node, list):
+        for value in node:
+            _json_values_for_key(value, key, found)
+
+
+def evpn_bgp_macip_esis(dut, mac):
+    """
+    ESIs carried by the Type-2 paths for `mac` in the EVPN table.
+
+    Returns a sorted list of ESI strings, [] when the MAC has paths but none
+    carries an ESI, and None when bgpd has no route for the MAC. The route
+    JSON layout varies by RD and path, so every "esi" key is collected.
+    """
+    out = dut.vtysh_cmd(f"show bgp l2vpn evpn route rd all mac {mac} json", isjson=True)
+    # bgpd always prints numPrefix/numPaths, even when nothing matches
+    if not isinstance(out, dict) or not out.get("numPaths"):
+        return None
+    found = []
+    _json_values_for_key(out, "esi", found)
+    # bgpd prints an all-zero ESI for a MAC with no ESI
+    return sorted({e for e in found if e and set(e.replace(":", "")) != {"0"}})
+
+
+def evpn_kernel_vxlan_fdb_entry(dut, mac, vni, vxlan="vxlan48"):
+    """
+    The vxlan "self" FDB entry for `mac` in `vni`, or None.
+
+    check_mac_in_fdb() only looks at the bridge "master" row; this is the
+    vxlan-port entry that carries the remote destination.
+
+    Returns {"dst", "nhid", "line"}. A single-VTEP entry has dst and no nhid;
+    an ES MAC has nhid and no dst. Entries of other VNIs are ignored.
+    """
+    out = dut.run(
+        f"bridge -d fdb show dev {vxlan} | grep -i -F -- {shlex.quote(mac)} || true"
+    )
+    for line in str(out).splitlines():
+        parts = line.split()
+        if "self" not in parts or _fdb_token(parts, "src_vni") != str(int(vni)):
+            continue
+        if not parts or parts[0].lower() != mac.lower():
+            continue
+        return {
+            "dst": _fdb_token(parts, "dst"),
+            "nhid": _fdb_token(parts, "nhid"),
+            "line": line.strip(),
+        }
+    return None
+
+
+def evpn_kernel_nexthop_group(dut, nhid):
+    """
+    Kernel nexthop `nhid` and, for a group, its members, or None when absent.
+
+    Uses `ip -j nexthop get id`, as evpn_verify_kernel_encap_vni() does, and
+    _kernel_nh_group_ids() for the member ids. Returns
+    {"fdb": bool, "members": [ids], "member_vteps": {id: gateway ip}}.
+    An EVPN ES group is an fdb group whose members are fdb nexthops with the
+    remote VTEP as gateway.
+    """
+
+    def _get(nh_id):
+        out = str(dut.run(f"ip -j nexthop get id {int(nh_id)} 2>/dev/null || true"))
+        try:
+            data = json.loads(out)
+        except ValueError:
+            return None
+        if isinstance(data, list):
+            data = data[0] if data else None
+        return data if isinstance(data, dict) else None
+
+    entry = _get(nhid)
+    if not entry:
+        return None
+    members = [str(m) for m in _kernel_nh_group_ids(entry.get("group", []))]
+    member_vteps = {}
+    for member in members:
+        member_entry = _get(member) or {}
+        member_vteps[member] = member_entry.get("gateway")
+    return {
+        "fdb": "fdb" in entry,
+        "members": members,
+        "member_vteps": member_vteps,
+        "entry": entry,
+    }
+
+
+def evpn_mac_snapshot(dut, mac, vni, esi=None, vxlan="vxlan48"):
+    """
+    One MAC through BGP, zebra and the kernel on `dut` (for logging and for
+    comparing a stage against another).
+    """
+    fdb = evpn_kernel_vxlan_fdb_entry(dut, mac, vni, vxlan)
+    snap = {
+        "bgp_macip_esis": evpn_bgp_macip_esis(dut, mac),
+        "zebra_mac": evpn_zebra_mac_entry(dut, vni, mac),
+        "kernel_fdb": fdb,
+        "kernel_nhg": (
+            evpn_kernel_nexthop_group(dut, fdb["nhid"]) if fdb and fdb["nhid"] else None
+        ),
+    }
+    if esi:
+        snap["zebra_es"] = evpn_zebra_es_state(dut, esi)
+        snap["bgp_es_vteps"] = evpn_bgp_es_vteps(dut, esi)
+    logger.info("%s: MAC %s VNI %s snapshot: %s", dut.name, mac, vni, snap)
+    return snap
+
+
+def evpn_check_remote_mac_vtep(dut, vni, mac, vtep, vxlan="vxlan48"):
+    """
+    None when `mac` is a plain single-VTEP remote MAC from `vtep` in zebra and
+    the kernel (dst <vtep>, no nhid) and BGP carries no ESI for it.
+    """
+    entry = evpn_zebra_mac_entry(dut, vni, mac)
+    if not entry or entry.get("type") != "remote" or "remoteEs" in entry:
+        return f"{dut.name}: zebra MAC {mac} is not a single-VTEP remote: {entry}"
+    if not _same_ip(entry.get("remoteVtep", ""), vtep):
+        return f"{dut.name}: zebra MAC {mac} remoteVtep {entry.get('remoteVtep')} != {vtep}"
+    fdb = evpn_kernel_vxlan_fdb_entry(dut, mac, vni, vxlan)
+    if not fdb or fdb["nhid"] or not _same_ip(fdb["dst"] or "", vtep):
+        return (
+            f"{dut.name}: kernel FDB for {mac} is not 'dst {vtep}' without nhid: {fdb}"
+        )
+    esis = evpn_bgp_macip_esis(dut, mac)
+    if esis != []:
+        return f"{dut.name}: BGP Type-2 for {mac} should carry no ESI, got {esis}"
+    return None
+
+
+def evpn_check_remote_mac_es(dut, vni, mac, esi, programmed, vxlan="vxlan48"):
+    """
+    None when `mac` is a remote ES MAC for `esi` in BGP and zebra and:
+      programmed=True  - the kernel entry is `nhid <zebra's ES group>` with no
+                         dst, and that fdb nexthop group has exactly the
+                         member ids zebra lists in `show evpn es json`, each
+                         pointing at the VTEP zebra assigned it;
+      programmed=False - the kernel has no vxlan FDB entry for it at all
+                         (a stale single-VTEP entry must not be left behind).
+    """
+    entry = evpn_zebra_mac_entry(dut, vni, mac)
+    if not entry or entry.get("type") != "remote" or entry.get("remoteEs") != esi:
+        return f"{dut.name}: zebra MAC {mac} is not remote behind ES {esi}: {entry}"
+    esis = evpn_bgp_macip_esis(dut, mac)
+    if not esis or esi not in esis:
+        return f"{dut.name}: BGP Type-2 for {mac} lacks ESI {esi}: {esis}"
+    fdb = evpn_kernel_vxlan_fdb_entry(dut, mac, vni, vxlan)
+    if not programmed:
+        if fdb:
+            return f"{dut.name}: kernel still has an FDB entry for ES MAC {mac}: {fdb}"
+        return None
+    es = evpn_zebra_es_state(dut, esi)
+    if not fdb or fdb["dst"] or str(fdb["nhid"]) != str(es["nhg_id"]):
+        return f"{dut.name}: kernel FDB for {mac} should be 'nhid {es['nhg_id']}' only: {fdb}"
+    # The kernel group must be exactly what zebra reports: the same member
+    # ids, and each member pointing at the VTEP zebra assigned that id to.
+    group = evpn_kernel_nexthop_group(dut, fdb["nhid"])
+    if not group or not group["fdb"]:
+        return f"{dut.name}: kernel nexthop group {fdb['nhid']} is not an fdb group: {group}"
+    zebra_members = {str(nh): vtep for vtep, nh in es["vtep_nhids"].items()}
+    if set(group["members"]) != set(zebra_members) or not es["vteps"]:
+        return (
+            f"{dut.name}: kernel group {fdb['nhid']} members {group['members']} "
+            f"!= zebra ES {esi} nexthop ids {sorted(zebra_members)}"
+        )
+    for member, vtep in zebra_members.items():
+        if not _same_ip(group["member_vteps"].get(member) or "", vtep):
+            return (
+                f"{dut.name}: kernel nexthop {member} points at "
+                f"{group['member_vteps'].get(member)}, zebra says VTEP {vtep}"
+            )
+    return None
+
+
+def evpn_check_mac_absent(dut, vni, mac, vxlan="vxlan48"):
+    """None when `mac` is gone from zebra, the kernel vxlan FDB and BGP."""
+    left = []
+    if evpn_zebra_mac_entry(dut, vni, mac):
+        left.append("zebra")
+    if evpn_kernel_vxlan_fdb_entry(dut, mac, vni, vxlan):
+        left.append("kernel vxlan FDB")
+    if evpn_bgp_macip_esis(dut, mac) is not None:
+        left.append("BGP")
+    return f"{dut.name}: MAC {mac} still present in {left}" if left else None

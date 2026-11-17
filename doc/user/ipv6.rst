@@ -1,0 +1,301 @@
+.. _ipv6-support:
+
+************
+IPv6 Support
+************
+
+FRR fully supports IPv6 routing.  As described so far, FRR supports RIPng,
+OSPFv3, and BGP-4+.  You can give IPv6 addresses to an interface and configure
+static IPv6 routing information.  FRR IPv6 also provides automatic address
+configuration via a feature called ``address auto configuration``.  To do it,
+the router must send router advertisement messages to the all nodes that exist
+on the network.
+
+Previous versions of FRR could be built without IPv6 support.  This is
+no longer possible.
+
+Router Advertisement
+====================
+
+.. clicmd:: show ipv6 nd ra-interfaces [vrf <VRFNAME|all>]
+
+   Show configured route advertisement interfaces. VRF subcommand only
+   applicable for netns-based vrfs.
+
+.. clicmd:: clear ipv6 nd prefix X:X::X:X/M interface IFNAME [vrf NAME] [count (1-3)] [valid-lifetime (0-4294967295)] [preferred-lifetime (0-4294967295)]
+
+   Send a short burst of router advertisements on the interface that carry the
+   prefix with the given lifetimes, so that hosts stop using addresses they
+   formed from it instead of waiting out the valid lifetime advertised earlier,
+   30 days by default. The configuration is not changed, so a prefix the
+   interface goes on advertising is announced with its configured lifetimes
+   again once the burst is over.
+
+   The prefix does not have to be one the interface advertises. A host that has
+   been moved to another port can still hold the prefix of the port it came
+   from, and the advertisement that retires it has to go out on the port the
+   host is now attached to. For such a prefix only a ``valid-lifetime`` of
+   ``0`` is accepted.
+
+   - ``count``: the number of advertisements to send, spaced 3 seconds apart
+     as RFC 4861 section 6.2.6 requires. Default: ``2``
+
+   - ``valid-lifetime`` and ``preferred-lifetime``: the lifetimes to advertise.
+     The preferred lifetime may not exceed the valid lifetime, since RFC 4861
+     section 4.6.2 has hosts discard such an option. Default: ``0``
+
+   The interface must be operationally up with router advertisements enabled,
+   and at most 16 prefixes can be in flight on an interface at a time. The
+   ``vrf`` keyword is only accepted with netns-based VRFs. While the burst is
+   in progress, ``show interface`` lists the prefix being flushed.
+
+   Note that RFC 4862 section 5.5.3 does not let a host lower the stored valid
+   lifetime of an address below two hours, so the address is deprecated at once
+   but only removed after that window.
+
+.. clicmd:: ipv6 nd suppress-ra
+
+   Don't send router advertisement messages. The ``no`` form of this command
+   enables sending RA messages. Note that while being suppressed, RA messages
+   might still be enabled by other daemons, such as bgpd or vrrpd.
+
+.. clicmd:: ipv6 nd prefix ipv6prefix [valid-lifetime] [preferred-lifetime] [off-link] [no-autoconfig] [router-address]
+
+   Configuring the IPv6 prefix to include in router advertisements. Several prefix
+   specific optional parameters and flags may follow:
+
+   - ``valid-lifetime``: the length of time in seconds during what the prefix is
+     valid for the purpose of on-link determination. Value ``infinite`` represents
+     infinity (i.e. a value of all one bits (``0xffffffff``)).
+     Range: ``(0-4294967295)``  Default: ``2592000``
+
+   - ``preferred-lifetime``: the length of time in seconds during what addresses
+     generated from the prefix remain preferred. Value ``infinite`` represents
+     infinity.
+     Range: ``(0-4294967295)``  Default: ``604800``
+
+   - ``off-link``: indicates that advertisement makes no statement about on-link or
+     off-link properties of the prefix.
+     Default: not set, i.e. this prefix can be used for on-link determination.
+
+   - ``no-autoconfig``: indicates to hosts on the local link that the specified prefix
+     cannot be used for IPv6 autoconfiguration.
+
+     Default: not set, i.e. prefix can be used for autoconfiguration.
+
+   - ``router-address``: indicates to hosts on the local link that the specified
+     prefix contains a complete IP address by setting R flag.
+
+     Default: not set, i.e. hosts do not assume a complete IP address is placed.
+
+.. clicmd:: ipv6 nd prefix-lifetime <valid-lifetime|infinite> <preferred-lifetime|infinite>
+
+   Lifetimes advertised for every prefix on the interface that does not name its
+   own, whether it was derived from an address configured on the interface or
+   came from an ``ipv6 nd prefix`` entry that left the lifetimes out. This avoids
+   having to name each prefix in order to shorten its lifetime.
+
+   A prefix whose ``ipv6 nd prefix`` entry gives lifetimes of its own carries
+   those and is not affected by this command. An entry that gives exactly the
+   RFC 4861 defaults, ``2592000`` and ``604800``, counts as giving none; the
+   running configuration leaves them out too.
+
+   Both values must be given. RFC 4861 section 4.6.2 requires hosts to discard a
+   prefix option whose preferred lifetime exceeds its valid lifetime, so
+   lowering one without the other would remove the prefix from stateless address
+   autoconfiguration entirely.
+
+   Note that RFC 4862 section 5.5.3 clamps the stored valid lifetime of an
+   address a host already holds to a minimum of two hours, so a value below
+   ``7200`` only takes full effect for addresses formed after the change.
+
+   A prefix lifetime shorter than a few advertisement intervals will cause a
+   host that misses an advertisement to lose the address, so ``ra-interval``
+   should be lowered alongside it. A warning is logged when the valid lifetime
+   is below three advertisement intervals.
+
+   Range: ``(0-4294967295)``  Default: not set, i.e. ``2592000`` and ``604800``
+   are used.
+
+.. clicmd:: ipv6 nd ra-interval [(1-1800)]
+
+   The maximum time allowed between sending unsolicited multicast router
+   advertisements from the interface, in seconds.
+   Default: ``600``
+
+.. clicmd:: ipv6 nd ra-interval [msec (70-1800000)]
+
+   The maximum time allowed between sending unsolicited multicast router
+   advertisements from the interface, in milliseconds.
+   Default: ``600000``
+
+.. clicmd:: ipv6 nd ra-fast-retrans
+
+   RFC4861 states that consecutive RA packets should be sent no more
+   frequently than three seconds apart. FRR by default allows faster
+   transmissions of RA packets in order to speed convergence and
+   neighbor establishment, particularly for unnumbered peering.  By
+   turning off ipv6 nd ra-fast-retrans, the implementation is
+   compliant with the RFC at the cost of slower convergence
+   and neighbor establishment.
+   Default: enabled
+
+.. clicmd:: ipv6 nd ra-retrans-interval [(0-4294967295)]
+
+   The value to be placed in the retrans timer field of router advertisements
+   sent from the interface, in msec. Indicates the interval between router
+   advertisement retransmissions. Setting the value to zero indicates that
+   the value is unspecified by this router. Must be between zero or 4294967295
+   msec.
+   Default: ``0``
+
+.. clicmd:: ipv6 nd ra-hop-limit [(0-255)]
+
+   The value to be placed in the hop count field of router advertisements sent
+   from the interface, in hops. Indicates the maximum diameter of the network.
+   Setting the value to zero indicates that the value is unspecified by this
+   router.  Must be between zero or 255 hops.
+   Default: ``64``
+
+.. clicmd:: ipv6 nd ra-lifetime [(0-9000)]
+
+   The value to be placed in the Router Lifetime field of router advertisements
+   sent from the interface, in seconds. Indicates the usefulness of the router
+   as a default router on this interface. Setting the value to zero indicates
+   that the router should not be considered a default router on this interface.
+   Must be either zero or between value specified with ``ipv6 nd ra-interval``
+   (or default) and 9000 seconds.
+   Default: ``1800``
+
+.. clicmd:: ipv6 nd reachable-time [(1-3600000)]
+
+   The value to be placed in the Reachable Time field in the Router
+   Advertisement messages sent by the router, in milliseconds. The configured
+   time enables the router to detect unavailable neighbors. The value zero
+   means unspecified (by this router).
+   Default: ``0``
+
+.. clicmd:: ipv6 nd managed-config-flag
+
+   Set/unset flag in IPv6 router advertisements which indicates to hosts that
+   they should use managed (stateful) protocol for addresses autoconfiguration
+   in addition to any addresses autoconfigured using stateless address
+   autoconfiguration.
+   Default: not set
+
+.. clicmd:: ipv6 nd other-config-flag
+
+   Set/unset flag in IPv6 router advertisements which indicates to hosts that
+   they should use administered (stateful) protocol to obtain autoconfiguration
+   information other than addresses.
+   Default: not set
+
+.. clicmd:: ipv6 nd home-agent-config-flag
+
+   Set/unset flag in IPv6 router advertisements which indicates to hosts that
+   the router acts as a Home Agent and includes a Home Agent Option.
+   Default: not set
+
+
+.. clicmd:: ipv6 nd home-agent-preference [(0-65535)]
+
+   The value to be placed in Home Agent Option, when Home Agent config flag is
+   set, which indicates to hosts Home Agent preference. The default value of 0
+   stands for the lowest preference possible.
+   Default: ``0``
+
+.. clicmd:: ipv6 nd home-agent-lifetime [(0-65520)]
+
+   The value to be placed in Home Agent Option, when Home Agent config flag is set,
+   which indicates to hosts Home Agent Lifetime. The default value of 0 means to
+   place the current Router Lifetime value.
+
+   Default: ``0``
+
+.. clicmd:: ipv6 nd adv-interval-option
+
+   Include an Advertisement Interval option which indicates to hosts the maximum time,
+   in milliseconds, between successive unsolicited Router Advertisements.
+   Default: not set
+
+.. clicmd:: ipv6 nd router-preference [(high|medium|low)]
+
+   Set default router preference in IPv6 router advertisements per RFC4191.
+   Default: medium
+
+.. clicmd:: ipv6 nd mtu [(1-65535)]
+
+   Include an MTU (type 5) option in each RA packet to assist the attached
+   hosts in proper interface configuration. The announced value is not verified
+   to be consistent with router interface MTU.
+
+   Default: don't advertise any MTU option.
+
+.. clicmd:: ipv6 nd rdnss ipv6address [lifetime]
+
+   Recursive DNS server address to advertise using the RDNSS (type 25) option
+   described in RFC8106. Can be specified more than once to advertise multiple
+   addresses. Note that hosts may choose to limit the number of RDNSS addresses
+   to track.
+
+   Optional parameter:
+
+   - ``lifetime``: the maximum time in seconds over which the specified address
+     may be used for domain name resolution. Value ``infinite`` represents
+     infinity (i.e. a value of all one bits (``0xffffffff``)). A value of 0
+     indicates that the address must no longer be used.
+     Range: ``(0-4294967295)``  Default: ``3 * ra-interval``
+
+   Default: do not emit RDNSS option
+
+.. clicmd:: ipv6 nd dnssl domain-name-suffix [lifetime]
+
+   Advertise DNS search list using the DNSSL (type 31) option described in
+   RFC8106. Specify more than once to advertise multiple domain name suffixes.
+   Host implementations may limit the number of honored search list entries.
+
+   Optional parameter:
+
+   - ``lifetime``: the maximum time in seconds over which the specified domain
+     suffix may be used in the course of  name resolution. Value ``infinite``
+     represents infinity (i.e. a value of all one bits (``0xffffffff``)). A
+     value of 0 indicates that the name suffix must no longer be used.
+     Range: ``(0-4294967295)``  Default: ``3 * ra-interval``
+
+   Default: do not emit DNSSL option
+
+.. clicmd:: ipv6 nd nat64 [X:X::X:X/M] [lifetime (0-65535)]
+
+   Include in RAs an advertisement of the NAT64 prefix in use (RFC8781).
+   (May be configured multiple times for multiple prefixes.)
+
+   If no prefix is given when configuring, the NAT64 default prefix of
+   64:ff9b::/96 is substituted.  Only prefixes with a prefix length of /96,
+   /64, /56, /48, /40 or /32 can be encoded into advertisements.
+
+   Lifetime is specified in seconds and defaults to ``3 * ra-interval``.  If
+   no value is configured, this is adjusted when ``ra-interval`` is changed.
+   A lifetime of 0 seconds is used to signal NAT64 prefixes that are no longer
+   valid.  Note that this is rounded up to multiples of 8 seconds as a
+   limitation of the option encoding.
+
+   Default: don't advertise any NAT64 prefix.
+
+Router Advertisement Configuration Example
+==========================================
+A small example:
+
+.. code-block:: frr
+
+   interface eth0
+    no ipv6 nd suppress-ra
+    ipv6 nd prefix 2001:0DB8:5009::/64
+
+
+.. seealso::
+
+   - :rfc:`2462` (IPv6 Stateless Address Autoconfiguration)
+   - :rfc:`4861` (Neighbor Discovery for IP Version 6 (IPv6))
+   - :rfc:`6275` (Mobility Support in IPv6)
+   - :rfc:`4191` (Default Router Preferences and More-Specific Routes)
+   - :rfc:`8106` (IPv6 Router Advertisement Options for DNS Configuration)

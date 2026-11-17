@@ -1,0 +1,1322 @@
+#!/usr/bin/env python
+# SPDX-License-Identifier: ISC
+
+#
+# test_evpn_mh.py
+#
+# Copyright (c) 2020 by
+# Cumulus Networks, Inc.
+# Anuradha Karuppiah
+#
+
+"""
+test_evpn_mh.py: Testing EVPN multihoming
+
+"""
+
+import os
+import sys
+import subprocess
+from functools import partial
+
+import pytest
+import json
+import platform
+from functools import partial
+
+pytestmark = [pytest.mark.bgpd, pytest.mark.evpn, pytest.mark.pimd]
+
+# Save the Current Working Directory to find configuration files.
+CWD = os.path.dirname(os.path.realpath(__file__))
+sys.path.append(os.path.join(CWD, "../"))
+
+# pylint: disable=C0413
+# Import topogen and topotest helpers
+from lib import topotest
+from lib.common_config import (
+    create_address_on_interface,
+    create_interface_in_kernel,
+    delete_address_on_interface,
+    kill_router_daemons,
+    shutdown_bringup_interface_in_kernel,
+    start_router_daemons,
+)
+from lib.evpn import (
+    evpn_bgp_es,
+    evpn_bgp_rd_paths,
+    evpn_verify_bgp_es_local,
+    evpn_verify_bgp_es_vtep,
+    evpn_verify_bgp_instance_absent,
+    evpn_verify_df_role,
+    evpn_verify_local_es_evi,
+    evpn_verify_mac_route,
+    evpn_verify_mh_mac,
+    evpn_verify_protodown_reason,
+    evpn_verify_type4_origin_absent,
+    evpn_verify_type4_route,
+)
+
+# Required to instantiate the topology builder class.
+from lib.topogen import Topogen, TopoRouter, get_topogen
+
+#####################################################
+##
+##   Network Topology Definition
+##
+## See topology picture at evpn-mh-topo-tests.pdf
+#####################################################
+
+
+def build_topo(tgen):
+    """
+    EVPN Multihoming Topology -
+    1. Two level CLOS
+    2. Two spine switches - spine1, spine2
+    3. Two racks with Top-of-Rack switches per rack - tormx1, tormx2
+    4. Two dual attached hosts per-rack - hostdx1, hostdx2
+    """
+
+    tgen.add_router("spine1")
+    tgen.add_router("spine2")
+    tgen.add_router("leaf1")
+    tgen.add_router("leaf2")
+    tgen.add_router("torm11")
+    tgen.add_router("torm12")
+    tgen.add_router("torm21")
+    tgen.add_router("torm22")
+    tgen.add_router("hostd11")
+    tgen.add_router("hostd12")
+    tgen.add_router("hostd21")
+    tgen.add_router("hostd22")
+
+    # On main router
+    # First switch is for a dummy interface (for local network)
+
+    ##################### spine1 ########################
+    # spine1-eth0 is connected to leaf1-eth0
+    switch = tgen.add_switch("sw1")
+    switch.add_link(tgen.gears["spine1"])
+    switch.add_link(tgen.gears["leaf1"])
+
+    # spine1-eth1 is connected to leaf2-eth0
+    switch = tgen.add_switch("sw2")
+    switch.add_link(tgen.gears["spine1"])
+    switch.add_link(tgen.gears["leaf2"])
+
+    # spine2-eth0 is connected to leaf1-eth1
+    switch = tgen.add_switch("sw3")
+    switch.add_link(tgen.gears["spine2"])
+    switch.add_link(tgen.gears["leaf1"])
+
+    # spine2-eth1 is connected to leaf2-eth1
+    switch = tgen.add_switch("sw4")
+    switch.add_link(tgen.gears["spine2"])
+    switch.add_link(tgen.gears["leaf2"])
+
+    ################## leaf1 ##########################
+    # leaf1-eth2 is connected to torm11-eth0
+    switch = tgen.add_switch("sw5")
+    switch.add_link(tgen.gears["leaf1"])
+    switch.add_link(tgen.gears["torm11"])
+
+    # leaf1-eth3 is connected to torm12-eth0
+    switch = tgen.add_switch("sw6")
+    switch.add_link(tgen.gears["leaf1"])
+    switch.add_link(tgen.gears["torm12"])
+
+    # leaf1-eth4 is connected to torm21-eth0
+    switch = tgen.add_switch("sw7")
+    switch.add_link(tgen.gears["leaf1"])
+    switch.add_link(tgen.gears["torm21"])
+
+    # leaf1-eth5 is connected to torm22-eth0
+    switch = tgen.add_switch("sw8")
+    switch.add_link(tgen.gears["leaf1"])
+    switch.add_link(tgen.gears["torm22"])
+
+    ##################### leaf2 ########################
+    # leaf2-eth2 is connected to torm11-eth1
+    switch = tgen.add_switch("sw9")
+    switch.add_link(tgen.gears["leaf2"])
+    switch.add_link(tgen.gears["torm11"])
+
+    # leaf2-eth3 is connected to torm12-eth1
+    switch = tgen.add_switch("sw10")
+    switch.add_link(tgen.gears["leaf2"])
+    switch.add_link(tgen.gears["torm12"])
+
+    # leaf2-eth4 is connected to torm21-eth1
+    switch = tgen.add_switch("sw11")
+    switch.add_link(tgen.gears["leaf2"])
+    switch.add_link(tgen.gears["torm21"])
+
+    # leaf2-eth5 is connected to torm22-eth1
+    switch = tgen.add_switch("sw12")
+    switch.add_link(tgen.gears["leaf2"])
+    switch.add_link(tgen.gears["torm22"])
+
+    ##################### torm11 ########################
+    # torm11-eth2 is connected to hostd11-eth0
+    switch = tgen.add_switch("sw13")
+    switch.add_link(tgen.gears["torm11"])
+    switch.add_link(tgen.gears["hostd11"])
+
+    # torm11-eth3 is connected to hostd12-eth0
+    switch = tgen.add_switch("sw14")
+    switch.add_link(tgen.gears["torm11"])
+    switch.add_link(tgen.gears["hostd12"])
+
+    ##################### torm12 ########################
+    # torm12-eth2 is connected to hostd11-eth1
+    switch = tgen.add_switch("sw15")
+    switch.add_link(tgen.gears["torm12"])
+    switch.add_link(tgen.gears["hostd11"])
+
+    # torm12-eth3 is connected to hostd12-eth1
+    switch = tgen.add_switch("sw16")
+    switch.add_link(tgen.gears["torm12"])
+    switch.add_link(tgen.gears["hostd12"])
+
+    ##################### torm21 ########################
+    # torm21-eth2 is connected to hostd21-eth0
+    switch = tgen.add_switch("sw17")
+    switch.add_link(tgen.gears["torm21"])
+    switch.add_link(tgen.gears["hostd21"])
+
+    # torm21-eth3 is connected to hostd22-eth0
+    switch = tgen.add_switch("sw18")
+    switch.add_link(tgen.gears["torm21"])
+    switch.add_link(tgen.gears["hostd22"])
+
+    ##################### torm22 ########################
+    # torm22-eth2 is connected to hostd21-eth1
+    switch = tgen.add_switch("sw19")
+    switch.add_link(tgen.gears["torm22"])
+    switch.add_link(tgen.gears["hostd21"])
+
+    # torm22-eth3 is connected to hostd22-eth1
+    switch = tgen.add_switch("sw20")
+    switch.add_link(tgen.gears["torm22"])
+    switch.add_link(tgen.gears["hostd22"])
+
+
+#####################################################
+##
+##   Tests starting
+##
+#####################################################
+
+tor_ips = {
+    "torm11": "192.168.100.15",
+    "torm12": "192.168.100.16",
+    "torm21": "192.168.100.17",
+    "torm22": "192.168.100.18",
+}
+
+svi_ips = {
+    "torm11": "45.0.0.2",
+    "torm12": "45.0.0.3",
+    "torm21": "45.0.0.4",
+    "torm22": "45.0.0.5",
+}
+
+tor_ips_rack_1 = {"torm11": "192.168.100.15", "torm12": "192.168.100.16"}
+
+tor_ips_rack_2 = {"torm21": "192.168.100.17", "torm22": "192.168.100.18"}
+
+host_es_map = {
+    "hostd11": "03:44:38:39:ff:ff:01:00:00:01",
+    "hostd12": "03:44:38:39:ff:ff:01:00:00:02",
+    "hostd21": "03:44:38:39:ff:ff:02:00:00:01",
+    "hostd22": "03:44:38:39:ff:ff:02:00:00:02",
+}
+
+
+def config_bond(node, bond_name, bond_members, bond_ad_sys_mac, br):
+    """
+    Used to setup bonds on the TORs and hosts for MH
+    """
+    node.run("ip link add dev %s type bond mode 802.3ad" % bond_name)
+    node.run("ip link set dev %s type bond lacp_rate 1" % bond_name)
+    node.run("ip link set dev %s type bond miimon 100" % bond_name)
+    node.run("ip link set dev %s type bond xmit_hash_policy layer3+4" % bond_name)
+    node.run("ip link set dev %s type bond min_links 1" % bond_name)
+    node.run(
+        "ip link set dev %s type bond ad_actor_system %s" % (bond_name, bond_ad_sys_mac)
+    )
+
+    for bond_member in bond_members:
+        shutdown_bringup_interface_in_kernel(node.tgen, node.name, bond_member, False)
+        node.run("ip link set dev %s master %s" % (bond_member, bond_name))
+        shutdown_bringup_interface_in_kernel(node.tgen, node.name, bond_member, True)
+
+    shutdown_bringup_interface_in_kernel(node.tgen, node.name, bond_name, True)
+
+    # if bridge is specified add the bond as a bridge member
+    if br:
+        node.run(" ip link set dev %s master bridge" % bond_name)
+        node.run("/sbin/bridge link set dev %s priority 8" % bond_name)
+        node.run("/sbin/bridge vlan del vid 1 dev %s" % bond_name)
+        node.run("/sbin/bridge vlan del vid 1 untagged pvid dev %s" % bond_name)
+        node.run("/sbin/bridge vlan add vid 1000 dev %s" % bond_name)
+        node.run("/sbin/bridge vlan add vid 1000 untagged pvid dev %s" % bond_name)
+
+
+def attach_bond_to_bridge(node, bond_name):
+    """
+    Re-attach an existing bond to the bridge with VLAN settings.
+    """
+    node.run("ip link set dev %s master bridge" % bond_name)
+    node.run("/sbin/bridge link set dev %s priority 8" % bond_name)
+    node.run("/sbin/bridge vlan del vid 1 dev %s" % bond_name)
+    node.run("/sbin/bridge vlan del vid 1 untagged pvid dev %s" % bond_name)
+    node.run("/sbin/bridge vlan add vid 1000 dev %s" % bond_name)
+    node.run("/sbin/bridge vlan add vid 1000 untagged pvid dev %s" % bond_name)
+
+
+def config_mcast_tunnel_termination_device(node):
+    """
+    The kernel requires a device to terminate VxLAN multicast tunnels
+    when EVPN-PIM is used for flooded traffic
+    """
+    create_interface_in_kernel(node.tgen, node.name, "ipmr-lo")
+    node.run("ip link set dev ipmr-lo mtu 16000")
+    node.run("ip link set dev ipmr-lo mode dormant")
+    shutdown_bringup_interface_in_kernel(node.tgen, node.name, "ipmr-lo", True)
+
+
+def config_bridge(node):
+    """
+    Create a VLAN aware bridge
+    """
+    node.run("ip link add dev bridge type bridge stp_state 0")
+    node.run("ip link set dev bridge type bridge vlan_filtering 1")
+    node.run("ip link set dev bridge mtu 9216")
+    node.run("ip link set dev bridge type bridge ageing_time 1800")
+    node.run("ip link set dev bridge type bridge mcast_snooping 0")
+    node.run("ip link set dev bridge type bridge vlan_stats_enabled 1")
+    shutdown_bringup_interface_in_kernel(node.tgen, node.name, "bridge", True)
+    node.run("/sbin/bridge vlan add vid 1000 dev bridge self")
+
+
+def config_vxlan(node, node_ip):
+    """
+    Create a VxLAN device for VNI 1000 and add it to the bridge.
+    VLAN-1000 is mapped to VNI-1000.
+    """
+    node.run("ip link add dev vx-1000 type vxlan id 1000 dstport 4789")
+    node.run("ip link set dev vx-1000 type vxlan nolearning")
+    node.run("ip link set dev vx-1000 type vxlan local %s" % node_ip)
+    node.run("ip link set dev vx-1000 type vxlan ttl 64")
+    node.run("ip link set dev vx-1000 mtu 9152")
+    node.run("ip link set dev vx-1000 type vxlan dev ipmr-lo group 239.1.1.100")
+    shutdown_bringup_interface_in_kernel(node.tgen, node.name, "vx-1000", True)
+
+    # bridge attrs
+    node.run("ip link set dev vx-1000 master bridge")
+    node.run("/sbin/bridge link set dev vx-1000 neigh_suppress on")
+    node.run("/sbin/bridge link set dev vx-1000 learning off")
+    node.run("/sbin/bridge link set dev vx-1000 priority 8")
+    node.run("/sbin/bridge vlan del vid 1 dev vx-1000")
+    node.run("/sbin/bridge vlan del vid 1 untagged pvid dev vx-1000")
+    node.run("/sbin/bridge vlan add vid 1000 dev vx-1000")
+    node.run("/sbin/bridge vlan add vid 1000 untagged pvid dev vx-1000")
+
+
+def config_svi(node, svi_pip):
+    """
+    Create an SVI for VLAN 1000
+    """
+    node.run("ip link add link bridge name vlan1000 type vlan id 1000 protocol 802.1q")
+    create_address_on_interface(node.tgen, node.name, "vlan1000", "%s/24" % svi_pip)
+    shutdown_bringup_interface_in_kernel(node.tgen, node.name, "vlan1000", True)
+    node.run("/sbin/sysctl net.ipv4.conf.vlan1000.arp_accept=1")
+    node.run("ip link add link vlan1000 name vlan1000-v0 type macvlan mode private")
+    node.run("/sbin/sysctl net.ipv6.conf.vlan1000-v0.accept_dad=0")
+    node.run("/sbin/sysctl net.ipv6.conf.vlan1000-v0.dad_transmits")
+    node.run("/sbin/sysctl net.ipv6.conf.vlan1000-v0.dad_transmits=0")
+    node.run("ip link set dev vlan1000-v0 address 00:00:5e:00:01:01")
+    shutdown_bringup_interface_in_kernel(node.tgen, node.name, "vlan1000-v0", True)
+    # metric 1024 is not working
+    create_address_on_interface(node.tgen, node.name, "vlan1000-v0", "45.0.0.1/24")
+
+
+def config_tor(tor_name, tor, tor_ip, svi_pip):
+    """
+    Create the bond/vxlan-bridge on the TOR which acts as VTEP and EPN-PE
+    """
+    # create a device for terminating VxLAN multicast tunnels
+    config_mcast_tunnel_termination_device(tor)
+
+    # create a vlan aware bridge
+    config_bridge(tor)
+
+    # create vxlan device and add it to bridge
+    config_vxlan(tor, tor_ip)
+
+    # create hostbonds and add them to the bridge
+    if "torm1" in tor_name:
+        sys_mac = "44:38:39:ff:ff:01"
+    else:
+        sys_mac = "44:38:39:ff:ff:02"
+    bond_member = tor_name + "-eth2"
+    config_bond(tor, "hostbond1", [bond_member], sys_mac, "bridge")
+
+    bond_member = tor_name + "-eth3"
+    config_bond(tor, "hostbond2", [bond_member], sys_mac, "bridge")
+
+    # create SVI
+    config_svi(tor, svi_pip)
+
+
+def config_tors(tgen, tors):
+    for tor_name in tors:
+        tor = tgen.gears[tor_name]
+        config_tor(tor_name, tor, tor_ips.get(tor_name), svi_ips.get(tor_name))
+
+
+def compute_host_ip_mac(host_name):
+    host_id = host_name.split("hostd")[1]
+    host_ip = "45.0.0." + host_id + "/24"
+    host_mac = "00:00:00:00:00:" + host_id
+
+    return host_ip, host_mac
+
+
+def config_host(host_name, host):
+    """
+    Create the dual-attached bond on host nodes for MH
+    """
+    bond_members = []
+    bond_members.append(host_name + "-eth0")
+    bond_members.append(host_name + "-eth1")
+    bond_name = "torbond"
+    config_bond(host, bond_name, bond_members, "00:00:00:00:00:00", None)
+
+    host_ip, host_mac = compute_host_ip_mac(host_name)
+    create_address_on_interface(host.tgen, host.name, bond_name, host_ip)
+    host.run("ip link set dev %s address %s" % (bond_name, host_mac))
+
+
+def config_hosts(tgen, hosts):
+    for host_name in hosts:
+        host = tgen.gears[host_name]
+        config_host(host_name, host)
+
+
+def setup_module(module):
+    "Setup topology"
+    if not topotest.platform_has_evpn():
+        pytest.skip("platform does not support EVPN")
+
+    tgen = Topogen(build_topo, module.__name__)
+    tgen.start_topology()
+
+    krel = platform.release()
+    if topotest.version_cmp(krel, "4.19") < 0:
+        tgen.errors = "kernel 4.19 needed for multihoming tests"
+        pytest.skip(tgen.errors)
+
+    tors = []
+    tors.append("torm11")
+    tors.append("torm12")
+    tors.append("torm21")
+    tors.append("torm22")
+    config_tors(tgen, tors)
+
+    # tgen.mininet_cli()
+    # This is a sample of configuration loading.
+    router_list = tgen.routers()
+    for rname, router in router_list.items():
+        router.load_config(
+            TopoRouter.RD_ZEBRA, os.path.join(CWD, "{}/zebra.conf".format(rname))
+        )
+        router.load_config(
+            TopoRouter.RD_PIM, os.path.join(CWD, "{}/pim.conf".format(rname))
+        )
+        router.load_config(
+            TopoRouter.RD_BGP, os.path.join(CWD, "{}/evpn.conf".format(rname))
+        )
+    tgen.start_router()
+
+    hosts = []
+    hosts.append("hostd11")
+    hosts.append("hostd12")
+    hosts.append("hostd21")
+    hosts.append("hostd22")
+    config_hosts(tgen, hosts)
+    # tgen.mininet_cli()
+
+
+def teardown_module(_mod):
+    "Teardown the pytest environment"
+    tgen = get_topogen()
+
+    # This function tears down the whole topology.
+    tgen.stop_topology()
+
+
+def check_local_es(esi, vtep_ips, dut_name, down_vteps):
+    """
+    Compare a local ES VTEP list with this topology's rack peers.
+
+    A single VTEP, DF role, or kernel nexthop belongs in lib.evpn. This
+    helper stays here because it knows which ToRs share a rack.
+    """
+    peer_ips = []
+    if "torm1" in dut_name:
+        tor_ips_rack = tor_ips_rack_1
+    else:
+        tor_ips_rack = tor_ips_rack_2
+
+    for tor_name, tor_ip in tor_ips_rack.items():
+        if dut_name not in tor_name:
+            peer_ips.append(tor_ip)
+
+    # remove down VTEPs from the peer check list
+    peer_set = set(peer_ips)
+    down_vtep_set = set(down_vteps)
+    peer_set = peer_set - down_vtep_set
+
+    vtep_set = set(vtep_ips)
+    diff = peer_set.symmetric_difference(vtep_set)
+
+    return (esi, diff) if diff else None
+
+
+def check_remote_es(esi, vtep_ips, dut_name, down_vteps):
+    """
+    Verify list of PEs associated with a remote ES
+    """
+    remote_ips = []
+
+    if "torm1" in dut_name:
+        tor_ips_rack = tor_ips_rack_2
+    else:
+        tor_ips_rack = tor_ips_rack_1
+
+    for _, tor_ip in tor_ips_rack.items():
+        remote_ips.append(tor_ip)
+
+    # remove down VTEPs from the remote check list
+    remote_set = set(remote_ips)
+    down_vtep_set = set(down_vteps)
+    remote_set = remote_set - down_vtep_set
+
+    vtep_set = set(vtep_ips)
+    diff = remote_set.symmetric_difference(vtep_set)
+
+    return (esi, diff) if diff else None
+
+
+def check_es(dut):
+    """
+    Verify list of PEs associated all ESs, local and remote
+    """
+    bgp_es = dut.vtysh_cmd("show bgp l2vp evpn es json")
+    bgp_es_json = json.loads(bgp_es)
+
+    result = None
+
+    expected_es_set = set([v for k, v in host_es_map.items()])
+    curr_es_set = []
+
+    # check is ES content is correct
+    for es in bgp_es_json:
+        esi = es["esi"]
+        curr_es_set.append(esi)
+        if not es.get("type", False):
+            return None
+        types = es["type"]
+        vtep_ips = []
+        for vtep in es.get("vteps", []):
+            vtep_ips.append(vtep["vtep_ip"])
+
+        if "local" in types:
+            result = check_local_es(esi, vtep_ips, dut.name, [])
+        else:
+            result = check_remote_es(esi, vtep_ips, dut.name, [])
+
+        if result:
+            return result
+
+    # check if all ESs are present
+    curr_es_set = set(curr_es_set)
+    result = curr_es_set.symmetric_difference(expected_es_set)
+
+    return result if result else None
+
+
+def check_one_es(dut, esi, down_vteps):
+    """
+    Verify list of PEs associated all ESs, local and remote
+    """
+    bgp_es = dut.vtysh_cmd("show bgp l2vp evpn es %s json" % esi)
+    es = json.loads(bgp_es)
+
+    if not es:
+        return "esi %s not found" % esi
+
+    esi = es["esi"]
+    if not es.get("type", False):
+        return None
+    types = es["type"]
+    vtep_ips = []
+    for vtep in es.get("vteps", []):
+        vtep_ips.append(vtep["vtep_ip"])
+
+    if "local" in types:
+        result = check_local_es(esi, vtep_ips, dut.name, down_vteps)
+    else:
+        result = check_remote_es(esi, vtep_ips, dut.name, down_vteps)
+
+    return result
+
+
+def check_type1_routes(peer, origin_name, expected_esis):
+    origin_vtep = tor_ips[origin_name]
+    out = peer.vtysh_cmd("show bgp l2vpn evpn route type 1")
+
+    if origin_vtep not in out:
+        return "%s type-1 routes missing origin VTEP %s" % (peer.name, origin_vtep)
+
+    for esi in expected_esis:
+        if esi not in out:
+            return "%s type-1 routes missing ESI %s" % (peer.name, esi)
+
+    return None
+
+
+def test_evpn_es():
+    """
+    Two ES are setup on each rack. This test checks if -
+    1. ES peer has been added to the local ES (via Type-1/EAD route)
+    2. The remote ESs are setup with the right list of PEs (via Type-1)
+    """
+
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    dut_name = "torm11"
+    dut = tgen.gears[dut_name]
+    test_fn = partial(check_es, dut)
+    _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
+
+    assertmsg = '"{}" ES content incorrect'.format(dut_name)
+    assert result is None, assertmsg
+    # tgen.mininet_cli()
+
+
+def test_evpn_mh_bgpd_restart_replays_local_es_evi():
+    """
+    Restart bgpd on one ToR and verify zebra's replay restores local ES-EVI
+    state after the L2VNI exists in bgpd.
+    """
+
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    dut_name = "torm11"
+    dut = tgen.gears[dut_name]
+    peer = tgen.gears["torm12"]
+    local_esis = [host_es_map["hostd11"], host_es_map["hostd12"]]
+
+    test_fn = partial(evpn_verify_local_es_evi, dut, local_esis)
+    _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
+    assertmsg = '"{}" local ES-EVI count incorrect before bgpd restart'.format(dut_name)
+    assert result is None, assertmsg
+
+    test_fn = partial(check_type1_routes, peer, dut_name, local_esis)
+    _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
+    assertmsg = '"{}" did not advertise Type-1/EAD before bgpd restart'.format(dut_name)
+    assert result is None, assertmsg
+
+    kill_router_daemons(tgen, dut_name, ["bgpd"])
+    start_router_daemons(tgen, dut_name, ["bgpd"])
+
+    test_fn = partial(evpn_verify_local_es_evi, dut, local_esis)
+    _, result = topotest.run_and_expect(test_fn, None, count=30, wait=2)
+    assertmsg = (
+        '"{}" bgpd did not recover local ES-EVI count after restart: {}'
+    ).format(dut_name, result)
+    assert result is None, assertmsg
+
+    test_fn = partial(check_type1_routes, peer, dut_name, local_esis)
+    _, result = topotest.run_and_expect(test_fn, None, count=30, wait=2)
+    assertmsg = '"{}" Type-1 routes missing after bgpd restart: {}'.format(
+        dut_name, result
+    )
+    assert result is None, assertmsg
+
+
+def test_evpn_ead_update():
+    """
+    Flap a host link one the remote rack and check if the EAD updates
+    are sent/processed for the corresponding ESI
+    """
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    # dut on rack1 and host link flap on rack2
+    dut_name = "torm11"
+    dut = tgen.gears[dut_name]
+
+    remote_tor_name = "torm21"
+    remote_tor = tgen.gears[remote_tor_name]
+
+    host_name = "hostd21"
+    host = tgen.gears[host_name]
+    esi = host_es_map.get(host_name)
+
+    # check if the VTEP list is right to start with
+    down_vteps = []
+    test_fn = partial(check_one_es, dut, esi, down_vteps)
+    _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
+    assertmsg = '"{}" ES content incorrect'.format(dut_name)
+    assert result is None, assertmsg
+
+    # down a remote host link and check if the EAD withdraw is rxed
+    # Note: LACP is not working as expected so I am temporarily shutting
+    # down the link on the remote TOR instead of the remote host
+    shutdown_bringup_interface_in_kernel(
+        remote_tor.tgen,
+        remote_tor.name,
+        f"{remote_tor_name}-{'eth2'}",
+        False,
+    )
+    down_vteps.append(tor_ips.get(remote_tor_name))
+    _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
+    assertmsg = '"{}" ES incorrect after remote link down'.format(dut_name)
+    assert result is None, assertmsg
+
+    # bring up remote host link and check if the EAD update is rxed
+    down_vteps.remove(tor_ips.get(remote_tor_name))
+    shutdown_bringup_interface_in_kernel(
+        remote_tor.tgen,
+        remote_tor.name,
+        f"{remote_tor_name}-{'eth2'}",
+        True,
+    )
+    _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
+    assertmsg = '"{}" ES incorrect after remote link flap'.format(dut_name)
+    assert result is None, assertmsg
+
+    # tgen.mininet_cli()
+
+
+def ping_anycast_gw(tgen):
+    # ping the anycast gw from the local and remote hosts to populate
+    # the mac address on the PEs
+    python3_path = tgen.net.get_exec_path(["python3", "python"])
+    script_path = os.path.abspath(os.path.join(CWD, "../lib/scapy_sendpkt.py"))
+    intf = "torbond"
+    ipaddr = "45.0.0.1"
+    ping_cmd = [
+        python3_path,
+        script_path,
+        "--imports=Ether,ARP",
+        "--interface=" + intf,
+        'Ether(dst="ff:ff:ff:ff:ff:ff")/ARP(pdst="{}")'.format(ipaddr),
+    ]
+    for name in ("hostd11", "hostd21", "hostd12", "hostd22"):
+        host = tgen.net.hosts[name]
+        _, stdout, _ = host.cmd_status(ping_cmd, warn=False, stderr=subprocess.STDOUT)
+        stdout = stdout.strip()
+        if stdout:
+            host.logger.debug(
+                "%s: arping on %s for %s returned: %s", name, intf, ipaddr, stdout
+            )
+
+
+def check_mac(dut, vni, mac, m_type, esi, intf, ping_gw=False, tgen=None):
+    """Refresh host MACs when asked, then use the shared MH MAC check."""
+    if ping_gw:
+        ping_anycast_gw(tgen)
+    return evpn_verify_mh_mac(dut, vni, mac, m_type, esi, intf)
+
+
+def test_evpn_mac():
+    """
+    1. Add a MAC on hostd11 and check if the MAC is synced between
+    torm11 and torm12. And installed as a local MAC.
+    2. Add a MAC on hostd21 and check if the MAC is installed as a
+    remote MAC on torm11 and torm12
+    """
+
+    tgen = get_topogen()
+
+    local_host = tgen.gears["hostd11"]
+    remote_host = tgen.gears["hostd21"]
+    tors = []
+    tors.append(tgen.gears["torm11"])
+    tors.append(tgen.gears["torm12"])
+
+    vni = 1000
+
+    # check if the rack-1 host MAC is present on all rack-1 PEs
+    # and points to local access port
+    m_type = "local"
+    _, mac = compute_host_ip_mac(local_host.name)
+    esi = host_es_map.get(local_host.name)
+    intf = "hostbond1"
+
+    for tor in tors:
+        test_fn = partial(check_mac, tor, vni, mac, m_type, esi, intf, True, tgen)
+        _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
+        assertmsg = '"{}" local MAC content incorrect'.format(tor.name)
+        assert result is None, assertmsg
+
+    # check if the rack-2 host MAC is present on all rack-1 PEs
+    # and points to the remote ES destination
+    m_type = "remote"
+    _, mac = compute_host_ip_mac(remote_host.name)
+    esi = host_es_map.get(remote_host.name)
+    intf = ""
+
+    for tor in tors:
+        test_fn = partial(check_mac, tor, vni, mac, m_type, esi, intf)
+        _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
+        assertmsg = '"{}" remote MAC content incorrect'.format(tor.name)
+        assert result is None, assertmsg
+
+
+def test_evpn_df():
+    """
+    1. Check the DF role on all the PEs on rack-1.
+    2. Increase the DF preference on the non-DF and check if it becomes
+       the DF winner.
+    """
+
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    # We will run the tests on just one ES
+    esi = host_es_map.get("hostd11")
+    intf = "hostbond1"
+
+    tors = []
+    tors.append(tgen.gears["torm11"])
+    tors.append(tgen.gears["torm12"])
+    df_node = "torm11"
+
+    # check roles on rack-1
+    for tor in tors:
+        role = "DF" if tor.name == df_node else "nonDF"
+        test_fn = partial(evpn_verify_df_role, tor, esi, role)
+        _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
+        assertmsg = '"{}" DF role incorrect'.format(tor.name)
+        assert result is None, assertmsg
+
+    # change df preference on the nonDF to make it the df
+    torm12 = tgen.gears["torm12"]
+    torm12.vtysh_cmd("conf\ninterface %s\nevpn mh es-df-pref %d" % (intf, 60000))
+    df_node = "torm12"
+
+    # re-check roles on rack-1; we should have a new winner
+    for tor in tors:
+        role = "DF" if tor.name == df_node else "nonDF"
+        test_fn = partial(evpn_verify_df_role, tor, esi, role)
+        _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
+        assertmsg = '"{}" DF role incorrect'.format(tor.name)
+        assert result is None, assertmsg
+
+    # tgen.mininet_cli()
+
+
+def test_evpn_vtep_change():
+    """
+    Test that changing the originator VTEP IP on a remote TOR removes the
+    stale VTEP from ES tables on the receiver.
+
+    Also verifies that local Type-4 (ESR) routes are properly updated when
+    VXLAN tunnel IP changes, preventing stale Type-4 routes.
+
+    torm21 has two loopback addresses: 192.168.100.17 (primary) and
+    192.168.100.117 (secondary). The VTEP is switched from primary to
+    secondary and back to verify stale VTEP cleanup.
+
+    1. Add secondary loopback on torm21.
+    2. Verify initial ES VTEP list is correct on torm11.
+    3. Switch VTEP from primary to secondary.
+    4. Verify new VTEP appears and old VTEP is removed.
+    5. Switch VTEP back to primary and verify convergence.
+    """
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    dut = tgen.gears["torm11"]
+    remote_tor = tgen.gears["torm21"]
+    esi = host_es_map.get("hostd21")
+    primary_vtep = "192.168.100.17"
+    secondary_vtep = "192.168.100.117"
+
+    # 1. Add secondary loopback address on torm21
+    create_address_on_interface(
+        remote_tor.tgen, remote_tor.name, "lo", f"{secondary_vtep}/32"
+    )
+
+    # 2. Verify primary VTEP is present initially
+    test_fn = partial(evpn_verify_bgp_es_vtep, dut, esi, primary_vtep, True)
+    _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
+    assertmsg = f"torm11: primary VTEP {primary_vtep} not found in ES {esi} initially"
+    assert result is None, assertmsg
+
+    # 3. Switch VTEP from primary to secondary (vxlan local IP change
+    #    triggers zebra to update ES originator IP and BGP re-advertises)
+    remote_tor.run(f"ip link set dev vx-1000 type vxlan local {secondary_vtep}")
+
+    # 4.1 Verify new VTEP appears and old VTEP is removed
+    test_fn = partial(evpn_verify_bgp_es_vtep, dut, esi, secondary_vtep, True)
+    _, result = topotest.run_and_expect(test_fn, None, count=30, wait=3)
+    assertmsg = (
+        f"torm11: secondary VTEP {secondary_vtep} not found in ES {esi} after switch"
+    )
+    assert result is None, assertmsg
+
+    # 4.2 Verify Type-4 route with old(primary IP) is gone on dut
+    test_fn = partial(evpn_verify_type4_origin_absent, dut, primary_vtep)
+    _, result = topotest.run_and_expect(test_fn, None, count=30, wait=3)
+    assert (
+        result is None
+    ), f"torm11: {result} (stale Type-4 with primary IP after tunnel IP change)"
+
+    test_fn = partial(evpn_verify_bgp_es_vtep, dut, esi, primary_vtep, False)
+    _, result = topotest.run_and_expect(test_fn, None, count=30, wait=3)
+    assertmsg = f"torm11: stale VTEP {primary_vtep} still in ES {esi} after switch"
+    assert result is None, assertmsg
+
+    # 5. Switch VTEP back to primary
+    remote_tor.run(f"ip link set dev vx-1000 type vxlan local {primary_vtep}")
+
+    # Verify restored
+    test_fn = partial(evpn_verify_bgp_es_vtep, dut, esi, primary_vtep, True)
+    _, result = topotest.run_and_expect(test_fn, None, count=30, wait=3)
+    assertmsg = f"torm11: primary VTEP {primary_vtep} not restored in ES {esi}"
+    assert result is None, assertmsg
+
+    # Verify Type-4 route with old(secondary IP) is gone on dut after restore
+    test_fn = partial(evpn_verify_type4_origin_absent, dut, secondary_vtep)
+    _, result = topotest.run_and_expect(test_fn, None, count=30, wait=3)
+    assert (
+        result is None
+    ), f"torm11: {result} (stale Type-4 with secondary IP after restore)"
+
+    test_fn = partial(evpn_verify_bgp_es_vtep, dut, esi, secondary_vtep, False)
+    _, result = topotest.run_and_expect(test_fn, None, count=30, wait=3)
+    assertmsg = f"torm11: stale VTEP {secondary_vtep} still in ES {esi} after restore"
+    assert result is None, assertmsg
+
+    # Cleanup: remove secondary loopback
+    delete_address_on_interface(
+        remote_tor.tgen, remote_tor.name, "lo", f"{secondary_vtep}/32"
+    )
+
+
+def test_evpn_uplink_tracking():
+    """
+    1. Wait for access ports to come out of startup-delay
+    2. disable uplinks and check if access ports have been protodowned
+    3. enable uplinks and check if access ports have been moved out
+       of protodown
+    """
+
+    tgen = get_topogen()
+
+    dut_name = "torm11"
+    dut = tgen.gears[dut_name]
+
+    # wait for protodown rc to clear after startup
+    test_fn = partial(evpn_verify_protodown_reason, dut, None)
+    _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
+    assertmsg = '"{}" protodown rc incorrect'.format(dut_name)
+    assert result is None, assertmsg
+
+    # disable the uplinks
+    shutdown_bringup_interface_in_kernel(dut.tgen, dut.name, f"{dut_name}-eth0", False)
+    shutdown_bringup_interface_in_kernel(dut.tgen, dut.name, f"{dut_name}-eth1", False)
+
+    # check if the access ports have been protodowned
+    test_fn = partial(evpn_verify_protodown_reason, dut, "uplinkDown")
+    _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
+    assertmsg = '"{}" protodown rc incorrect'.format(dut_name)
+    assert result is None, assertmsg
+
+    # enable the uplinks
+    shutdown_bringup_interface_in_kernel(dut.tgen, dut.name, f"{dut_name}-eth0", True)
+    shutdown_bringup_interface_in_kernel(dut.tgen, dut.name, f"{dut_name}-eth1", True)
+
+    # check if the access ports have been moved out of protodown
+    test_fn = partial(evpn_verify_protodown_reason, dut, None)
+    _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
+    assertmsg = '"{}" protodown rc incorrect'.format(dut_name)
+    assert result is None, assertmsg
+
+
+def test_evpn_access_vlan_vni_count():
+    """
+    Test EVPN access VLAN VNI count feature
+
+    This test verifies the fix for the issue where VLAN 1 acts as a placeholder
+    when new VNIs are added. The VNI count should track multiple VNIs associated
+    with the same VLAN and prevent incorrect removal of VLAN-VNI mappings.
+    """
+
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    dut_name = "torm11"
+    dut = tgen.gears[dut_name]
+
+    # Test JSON output includes vniCount field
+    output = dut.vtysh_cmd("show evpn access-vlan json", isjson=True)
+    if output:
+        for vlan_entry in output:
+            if "vniCount" in vlan_entry:
+                assertmsg = "vniCount should be >= 1 for active VLAN, got {}".format(
+                    vlan_entry["vniCount"]
+                )
+                assert vlan_entry["vniCount"] >= 1, assertmsg
+
+    # Test text output includes VNI-count column
+    output = dut.vtysh_cmd("show evpn access-vlan", isjson=False)
+    if output and "VLAN" in output:
+        assertmsg = "VNI-count column missing in 'show evpn access-vlan' output"
+        assert "VNI-count" in output, assertmsg
+
+
+def test_evpn_es_config_without_bridge():
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    dut = tgen.gears["torm11"]
+    bond_name = "hostbond1"
+
+    try:
+        # Remove bond from bridge, then apply ES config on the interface.
+        dut.run(f"ip link set dev {bond_name} nomaster")
+
+        def _bond_detached():
+            out = dut.run(f"ip -o link show dev {bond_name}")
+            return None if "master bridge" not in out else "bond still bridged"
+
+        test_fn = partial(_bond_detached)
+        _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
+        assertmsg = f'"{dut.name}" bond still has bridge master'
+        assert result is None, assertmsg
+
+        dut.vtysh_cmd(
+            f"""
+            conf
+              interface {bond_name}
+                evpn mh es-id 3883244
+                evpn mh es-sys-mac 02:00:5e:9e:e2:0d
+            """
+        )
+
+        status = dut.check_router_running()
+        assertmsg = f"Router {dut.name} has issues after ES config: {status}"
+        assert not status, assertmsg
+    finally:
+        # Restore original bond and EVPN MH config.
+        attach_bond_to_bridge(dut, bond_name)
+        dut.vtysh_cmd(
+            f"""
+            conf
+              interface {bond_name}
+                evpn mh es-id 1
+                evpn mh es-sys-mac 44:38:39:ff:ff:01
+            """
+        )
+
+
+def test_evpn_svi_mac_withdraw_on_svi_del():
+    """
+    EVPN-MH advertises the SVI MAC as a MAC-only type-2 route once a
+    local ES is configured.
+    1. Restart zebra on torm11 to re-originate the SVI MAC route (it
+       does not survive the bgpd restart done earlier in this file).
+    2. Verify torm11's SVI MAC-only route is present on torm12.
+    3. Delete the vlan1000 SVI on torm11.
+    4. Verify the SVI MAC-only route is withdrawn on torm12.
+    5. Restore the SVI.
+    """
+
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    dut = tgen.gears["torm12"]
+    origin_name = "torm11"
+    origin = tgen.gears[origin_name]
+
+    # A bgpd restart earlier in this file lost the SVI MAC route for
+    # good: with graceful restart registered on the zapi session, zebra
+    # retains its EVPN state on client close and short-circuits the
+    # advertise-all-vni processing on reconnect, so nothing replays the
+    # SVI MAC to the restarted bgpd. Restarting zebra rebuilds its MAC
+    # table from scratch and re-originates the route, so this test
+    # starts with the route present.
+    kill_router_daemons(tgen, origin_name, ["zebra"])
+    start_router_daemons(tgen, origin_name, ["zebra"])
+
+    svi_mac = json.loads(origin.run("ip -json link show vlan1000"))[0]["address"]
+    rd = json.loads(origin.vtysh_cmd("show bgp l2vpn evpn vni 1000 json"))["rd"]
+
+    # the SVI MAC-only route must be present before the SVI is deleted
+    test_fn = partial(evpn_verify_mac_route, dut, rd, svi_mac, True)
+    _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
+    assertmsg = f'"{origin_name}" SVI MAC route missing on {dut.name}: {result}'
+    assert result is None, assertmsg
+
+    try:
+        # delete the SVI (including its VRR macvlan)
+        origin.run("ip link del dev vlan1000-v0")
+        origin.run("ip link del dev vlan1000")
+
+        # the SVI MAC-only route must be withdrawn
+        test_fn = partial(evpn_verify_mac_route, dut, rd, svi_mac, False)
+        _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
+        assertmsg = (
+            f'"{origin_name}" SVI MAC route not withdrawn on {dut.name} '
+            f"after SVI delete: {result}"
+        )
+        assert result is None, assertmsg
+    finally:
+        # Restore the SVI, including the vlan1000-v0 VRR macvlan.
+        config_svi(origin, svi_ips.get(origin_name))
+
+
+def check_es_evpn_routes(tgen, dut, observer, esi, mac, vni):
+    """
+    Return None if the Type-1 and Type-2 routes that dut originates for esi
+    are present on dut and observer, an error string otherwise. The
+    VxLAN devices in this topology use a multicast underlay, so no Type-3
+    routes are exchanged.
+    """
+    es_rd = evpn_bgp_es(dut, esi).get("rd")
+    vni_rd = json.loads(
+        dut.vtysh_cmd("show bgp l2vpn evpn vni %d json" % vni) or "{}"
+    ).get("rd")
+    if not es_rd or not vni_rd:
+        return "%s ES RD %s or VNI %d RD %s missing" % (dut.name, es_rd, vni, vni_rd)
+
+    # refresh the host MACs so the ES MAC route is originated again
+    ping_anycast_gw(tgen)
+
+    routes = (
+        ("EAD-per-ES", 1, es_rd, "[4294967295]:[%s]" % esi, None),
+        ("EAD-per-EVI", 1, vni_rd, "[0]:[%s]" % esi, None),
+        ("MAC-IP", 2, vni_rd, "[%s]" % mac, esi),
+    )
+    errors = []
+    for node in (dut, observer):
+        for name, route_type, rd, match, path_esi in routes:
+            paths = evpn_bgp_rd_paths(node, route_type, rd, match)
+            if path_esi:
+                paths = [path for path in paths if path.get("esi") == path_esi]
+            if not paths:
+                errors.append(
+                    "%s missing %s route %s under RD %s" % (node.name, name, match, rd)
+                )
+
+    return "\n".join(errors) if errors else None
+
+
+def check_rebuilt_es(tgen, dut, observer, esi, originator, mac, vni, vni_count):
+    """
+    Return None once the local ES and all its EVPN state is rebuilt on dut
+    and visible on observer, an error string otherwise.
+    """
+    es = evpn_bgp_es(dut, esi)
+    checks = (
+        ("ES routes", check_es_evpn_routes(tgen, dut, observer, esi, mac, vni)),
+        (
+            "local Type-4",
+            evpn_verify_type4_route(dut, esi, originator, True, self_originate=True),
+        ),
+        ("peer Type-4", evpn_verify_type4_route(observer, esi, originator, True)),
+        (
+            "ES-EVI count",
+            (
+                None
+                if es.get("vniCount") == vni_count
+                else "vniCount %s, expected %s: %s"
+                % (es.get("vniCount"), vni_count, es)
+            ),
+        ),
+        ("local DF role", evpn_verify_df_role(dut, esi, "DF")),
+        ("peer DF role", evpn_verify_df_role(observer, esi, "nonDF")),
+    )
+    errors = ["%s: %s" % check for check in checks if check[1] is not None]
+    return "\n".join(errors) if errors else None
+
+
+def test_evpn_mh_bgp_instance_delete_readd():
+    """
+    Delete and re-add the BGP instance on torm11 while its local ES stays
+    operational in zebra.
+    1. Verify the local ES is released and its Type-4 route is withdrawn
+       on torm12 after the instance is deleted.
+    2. Re-add the instance and verify the ES is rebuilt with the same
+       ES-EVI count, the ES's Type-1, Type-2 and Type-4 routes are
+       exchanged again and the DF election result is unchanged.
+    3. Repeat once more to exercise an ES that outlived the instance.
+    """
+
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    dut = tgen.gears["torm11"]
+    observer = tgen.gears["torm12"]
+    esi = host_es_map["hostd12"]
+    originator = tor_ips["torm11"]
+    _, mac = compute_host_ip_mac("hostd12")
+    vni = 1000
+    instance = "router bgp 65002"
+
+    test_fn = partial(evpn_verify_type4_route, observer, esi, originator, True)
+    _, result = topotest.run_and_expect(test_fn, None, count=30, wait=1)
+    assert result is None, result
+
+    test_fn = partial(check_es_evpn_routes, tgen, dut, observer, esi, mac, vni)
+    _, result = topotest.run_and_expect(test_fn, None, count=30, wait=1)
+    assert result is None, result
+
+    vni_count = evpn_bgp_es(dut, esi).get("vniCount")
+    assert vni_count, "ES %s has no ES-EVIs on %s" % (esi, dut.name)
+
+    for _ in range(2):
+        dut.vtysh_cmd("configure terminal\nno %s" % instance)
+        test_fn = partial(evpn_verify_bgp_instance_absent, dut, instance)
+        _, result = topotest.run_and_expect(test_fn, None, count=30, wait=1)
+        assert result is None, result
+
+        test_fn = partial(evpn_verify_bgp_es_local, dut, esi, False)
+        _, result = topotest.run_and_expect(test_fn, None, count=30, wait=1)
+        assert result is None, result
+
+        test_fn = partial(evpn_verify_type4_route, observer, esi, originator, False)
+        _, result = topotest.run_and_expect(test_fn, None, count=30, wait=1)
+        assert result is None, result
+
+        dut.cmd_raises("vtysh -f %s/torm11/evpn.conf" % CWD)
+
+        test_fn = partial(
+            check_rebuilt_es, tgen, dut, observer, esi, originator, mac, vni, vni_count
+        )
+        _, result = topotest.run_and_expect(test_fn, None, count=60, wait=1)
+        assert result is None, result
+
+    assert dut.check_router_running() == "", "torm11 daemons are not running"
+
+
+def test_evpn_mh_skip_evpn_imported_smoke():
+    """Verify skip-evpn-imported coexists with EVPN-MH forwarding state."""
+
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    # This topology is L2 EVPN-MH and has no tenant L3VNI.  Use the default
+    # BGP EVPN context for the CLI coexistence check, while the MH assertions
+    # validate the existing ES control plane and dataplane behavior.
+    tors = (tgen.gears["torm11"], tgen.gears["torm12"])
+    asns = {"torm11": 65002, "torm12": 65003}
+    peers = {"torm11": ("leaf1", "leaf2"), "torm12": ("leaf1", "leaf2")}
+    command = "advertise ipv4 unicast skip-evpn-imported"
+
+    def configure_skip(node, enabled):
+        state = command if enabled else "no " + command
+        node.vtysh_cmd(
+            "configure terminal\n"
+            "router bgp {asn}\n"
+            " address-family l2vpn evpn\n"
+            "  {state}\n"
+            " exit-address-family\n"
+            "end".format(asn=asns[node.name], state=state)
+        )
+
+    try:
+        for tor in tors:
+            configure_skip(tor, True)
+            running = tor.vtysh_cmd("show running-config bgpd")
+            assert (
+                command in running
+            ), "{0}: expected {1} in running configuration\n{2}".format(
+                tor.name, command, running
+            )
+
+        for tor in tors:
+
+            def evpn_peers_established(tor=tor):
+                output = tor.vtysh_cmd("show bgp l2vpn evpn summary")
+                bad_states = ("Active", "Connect", "Idle", "OpenSent", "OpenConfirm")
+                return (
+                    None
+                    if all(peer in output for peer in peers[tor.name])
+                    and not any(state in output for state in bad_states)
+                    else output
+                )
+
+            _, result = topotest.run_and_expect(
+                evpn_peers_established, None, count=20, wait=3
+            )
+            assert (
+                result is None
+            ), "{0}: expected EVPN peers {1} established\n{2}".format(
+                tor.name, peers[tor.name], result
+            )
+
+            def mh_state_present(tor=tor):
+                output = tor.vtysh_cmd("show evpn es detail")
+                return None if "ESI" in output else output
+
+            _, result = topotest.run_and_expect(
+                mh_state_present, None, count=20, wait=3
+            )
+            assert result is None, "{0}: expected ESI state present\n{1}".format(
+                tor.name, result
+            )
+
+        remote_esi = host_es_map["hostd21"]
+        ping_anycast_gw(tgen)
+        for tor in tors:
+            # Remote ES control-plane state is verified in bgpd, using the
+            # same checker as the existing MH tests (including its VTEP list).
+            test_fn = partial(check_one_es, tor, remote_esi, [])
+            _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
+            assert result is None, (
+                "{0}: expected remote EVPN-MH ESI {1} and its VTEPs; "
+                "actual={2}\nBGP ES state:\n{3}\nZebra ES state:\n{4}".format(
+                    tor.name,
+                    remote_esi,
+                    result,
+                    tor.vtysh_cmd("show bgp l2vpn evpn es detail json"),
+                    tor.vtysh_cmd("show evpn es detail"),
+                )
+            )
+    finally:
+        for tor in tors:
+            configure_skip(tor, False)
+
+
+if __name__ == "__main__":
+    args = ["-s"] + sys.argv[1:]
+    sys.exit(pytest.main(args))

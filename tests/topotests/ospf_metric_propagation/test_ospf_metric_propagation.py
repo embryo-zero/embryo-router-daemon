@@ -1,0 +1,490 @@
+#!/usr/bin/env python
+# SPDX-License-Identifier: ISC
+
+#
+# test_ospf_metric_propagation.py
+#
+# Copyright (c) 2023 ATCorp
+# Jafar Al-Gharaibeh
+#
+
+import os
+import sys
+import json
+from functools import partial
+import pytest
+
+# pylint: disable=C0413
+# Import topogen and topotest helpers
+from lib import topotest
+from lib.topogen import Topogen, get_topogen
+from lib.topolog import logger
+from lib.common_config import shutdown_bringup_interface_in_kernel
+
+
+"""
+test_ospf_metric_propagation.py: Test OSPF/BGP metric propagation
+"""
+
+TOPOLOGY = """
+                                      +-----+                           +-----+
+                                 eth1 |     |           eth0            |     | eth2
+                        +-------------+ rA  +---------------------------+ rB  +---------------+
+                        |          .5 |     | .5                     .6 |     | .6            |
+                        |             +--+--+     10.0.50.0/24          +--+--+ .6            |
+                        |                |.5                               |.6                |
+                        |            eth2|                             eth1|                  |
+                 10.0.10.0/24            |                                 |                  |
+                        |            10.0.20.0/24                   10.0.30.0/24          10.0.40.0/24
+                        |blue            |blue                             |blue              |blue
+                        |                |                                 |                  |
+                    eth1|.1          eth1|.2                           eth1|.3            eth1|.4
+    +-----+          +--+--+          +--+--+           +-----+          +-+---+            +-+---+         +------+
+    |     |eth0  eth2|     |   eth0   |     |eth2   eth1|     |eth2  eth3|     |   eth0     |     |eth2 eth0|      |
+    | h1  +----------+ R1  +----------+ R2  +-----------+ rC  +----------+ R3  +------------+ R4  +---------+ h2   |
+    |     |          |     |          |     |           |     |          |     |            |     |         |      |
+    +-----+.2     .1 +-----+.1      .2+-----+.2      .7 +-----+.7      .3+-----+.3        .4+-----+.4     .2+------+
+                  green                    green                      green                       green
+
+       10.0.91.0/24        10.0.1.0/24      10.0.70.0/24      10.0.80.0/24     10.0.3.0/24        10.0.94.0/24
+"""
+
+# Save the Current Working Directory to find configuration files.
+CWD = os.path.dirname(os.path.realpath(__file__))
+sys.path.append(os.path.join(CWD, "../"))
+
+# Required to instantiate the topology builder class.
+
+pytestmark = [pytest.mark.ospfd, pytest.mark.bgpd]
+
+
+def build_topo(tgen):
+    "Build function"
+
+    # Create 4 routers
+    for routern in range(1, 5):
+        tgen.add_router("r{}".format(routern))
+
+    tgen.add_router("ra")
+    tgen.add_router("rb")
+    tgen.add_router("rc")
+    tgen.add_router("h1")
+    tgen.add_router("h2")
+
+    # Interconect router 1, 2
+    switch = tgen.add_switch("s1-2")
+    switch.add_link(tgen.gears["r1"])
+    switch.add_link(tgen.gears["r2"])
+
+    # Interconect router 3, 4
+    switch = tgen.add_switch("s3-4")
+    switch.add_link(tgen.gears["r3"])
+    switch.add_link(tgen.gears["r4"])
+
+    # Interconect router a, b
+    switch = tgen.add_switch("sa-b")
+    switch.add_link(tgen.gears["ra"])
+    switch.add_link(tgen.gears["rb"])
+
+    # Interconect router 1, a
+    switch = tgen.add_switch("s1-a")
+    switch.add_link(tgen.gears["r1"])
+    switch.add_link(tgen.gears["ra"])
+
+    # Interconect router 2, a
+    switch = tgen.add_switch("s2-a")
+    switch.add_link(tgen.gears["r2"])
+    switch.add_link(tgen.gears["ra"])
+
+    # Interconect router 3, b
+    switch = tgen.add_switch("s3-b")
+    switch.add_link(tgen.gears["r3"])
+    switch.add_link(tgen.gears["rb"])
+
+    # Interconect router 4, b
+    switch = tgen.add_switch("s4-b")
+    switch.add_link(tgen.gears["r4"])
+    switch.add_link(tgen.gears["rb"])
+
+    # Interconect router 1, h1
+    switch = tgen.add_switch("s1-h1")
+    switch.add_link(tgen.gears["r1"])
+    switch.add_link(tgen.gears["h1"])
+
+    # Interconect router 4, h2
+    switch = tgen.add_switch("s4-h2")
+    switch.add_link(tgen.gears["r4"])
+    switch.add_link(tgen.gears["h2"])
+
+    # Interconect router 2, c
+    switch = tgen.add_switch("s2-c")
+    switch.add_link(tgen.gears["r2"])
+    switch.add_link(tgen.gears["rc"])
+
+    # Interconect router 3, c
+    switch = tgen.add_switch("s3-c")
+    switch.add_link(tgen.gears["r3"])
+    switch.add_link(tgen.gears["rc"])
+
+
+def setup_module(mod):
+    if not topotest.platform_has_vrf():
+        pytest.skip("platform does not support VRF")
+
+    logger.info("OSPF Metric Propagation:\n {}".format(TOPOLOGY))
+
+    tgen = Topogen(build_topo, mod.__name__)
+    tgen.start_topology()
+
+    # Starting Routers
+    router_list = tgen.routers()
+
+    # Create VRFs and bind to interfaces
+    for routern in range(1, 5):
+        rname = "r{}".format(routern)
+        tgen.net[rname].cmd("ip link add name blue type vrf table 11")
+        shutdown_bringup_interface_in_kernel(tgen, rname, "blue", True)
+        tgen.net[rname].cmd("ip link add name green type vrf table 12")
+        shutdown_bringup_interface_in_kernel(tgen, rname, "green", True)
+    for routern in range(1, 5):
+        tgen.net["r{}".format(routern)].cmd(
+            "ip link set dev r{}-eth1 vrf blue up".format(routern)
+        )
+        tgen.net["r{}".format(routern)].cmd(
+            "ip link set dev r{}-eth2 vrf green up".format(routern)
+        )
+
+    for router in router_list.values():
+        router.load_frr_config()
+
+    # Initialize all routers.
+    tgen.start_router()
+    for router in router_list.values():
+        if router.has_version("<", "4.20"):
+            tgen.set_error("unsupported version")
+
+
+def teardown_module():
+    "Teardown the pytest environment"
+    tgen = get_topogen()
+    tgen.stop_topology()
+
+
+def set_link_states(tgen, link1_up, link2_up, link3_up, link4_up):
+    """
+    Set link states explicitly to ensure test independence.
+    link1: r1-eth1 (R1 to Ra in VRF blue)
+    link2: r2-eth1 (R2 to Ra in VRF blue)
+    link3: r3-eth1 (R3 to Rb in VRF blue)
+    link4: r4-eth1 (R4 to Rb in VRF blue)
+    """
+    if link1_up:
+        shutdown_bringup_interface_in_kernel(tgen, 'r1', "r1-eth1", True)
+    else:
+        shutdown_bringup_interface_in_kernel(tgen, 'r1', "r1-eth1", False)
+
+    if link2_up:
+        shutdown_bringup_interface_in_kernel(tgen, 'r2', "r2-eth1", True)
+    else:
+        shutdown_bringup_interface_in_kernel(tgen, 'r2', "r2-eth1", False)
+
+    if link3_up:
+        shutdown_bringup_interface_in_kernel(tgen, 'r3', "r3-eth1", True)
+    else:
+        shutdown_bringup_interface_in_kernel(tgen, 'r3', "r3-eth1", False)
+
+    if link4_up:
+        shutdown_bringup_interface_in_kernel(tgen, 'r4', "r4-eth1", True)
+    else:
+        shutdown_bringup_interface_in_kernel(tgen, 'r4', "r4-eth1", False)
+
+
+def test_all_links_up():
+    "Test path R1 -> Ra -> Rb -> R4"
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip("skipped because of router(s) failure")
+
+    r1 = tgen.gears["r1"]
+    json_file = "{}/r1/show_ip_route-1.json".format(CWD)
+    expected = json.loads(open(json_file).read())
+    test_func = partial(
+        topotest.router_json_cmp, r1, "show ip route vrf green 10.0.94.2 json", expected
+    )
+    _, result = topotest.run_and_expect(test_func, None, count=60, wait=1)
+
+    assertmsg = "r1 JSON output mismatches"
+    assert result is None, assertmsg
+
+
+def test_static():
+    "Test static route at R1 leaked from VRF green"
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip("skipped because of router(s) failure")
+
+    r1 = tgen.gears["r1"]
+    json_file = "{}/r1/show_ip_route_static.json".format(CWD)
+    expected = json.loads(open(json_file).read())
+    test_func = partial(
+        topotest.router_json_cmp, r1, "show ip route 10.48.48.0/24 json", expected
+    )
+    _, result = topotest.run_and_expect(test_func, None, count=60, wait=1)
+
+    assertmsg = "r1 JSON output mismatches"
+    assert result is None, assertmsg
+
+
+def test_link_1_down():
+    "Test path R1 -> R2 -> Ra -> Rb -> R4"
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip("skipped because of router(s) failure")
+
+    # Explicitly set link states: link1 down, others up
+    set_link_states(tgen, link1_up=False, link2_up=True, link3_up=True, link4_up=True)
+    r1 = tgen.gears["r1"]
+
+    json_file = "{}/r1/show_ip_route-2.json".format(CWD)
+    expected = json.loads(open(json_file).read())
+    test_func = partial(
+        topotest.router_json_cmp, r1, "show ip route vrf green 10.0.94.2 json", expected
+    )
+    _, result = topotest.run_and_expect(test_func, None, count=60, wait=1)
+
+    assertmsg = "r1 JSON output mismatches"
+    assert result is None, assertmsg
+
+
+def test_link_1_2_down():
+    "Test path R1 -> R2 -> Rc -> R3 -> Rb -> R4"
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip("skipped because of router(s) failure")
+
+    # Explicitly set link states: link1 down, link2 down, link3 up, link4 up
+    set_link_states(tgen, link1_up=False, link2_up=False, link3_up=True, link4_up=True)
+    # Bounce r1-eth0 and r2-eth2 to trigger route recalculation
+    shutdown_bringup_interface_in_kernel(tgen, 'r1', "r1-eth0", False)
+    shutdown_bringup_interface_in_kernel(tgen, 'r2', "r2-eth2", False)
+    shutdown_bringup_interface_in_kernel(tgen, 'r2', "r2-eth2", True)
+    shutdown_bringup_interface_in_kernel(tgen, 'r1', "r1-eth0", True)
+    r1 = tgen.gears["r1"]
+
+    json_file = "{}/r1/show_ip_route-3.json".format(CWD)
+    expected = json.loads(open(json_file).read())
+    test_func = partial(
+        topotest.router_json_cmp, r1, "show ip route vrf green 10.0.94.2 json", expected
+    )
+    _, result = topotest.run_and_expect(test_func, None, count=60, wait=1)
+
+    assertmsg = "r1 JSON output mismatches"
+    assert result is None, assertmsg
+
+
+def test_link_1_2_3_down():
+    "Test path R1 -> R2 -> Rc -> R3  -> R4"
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip("skipped because of router(s) failure")
+
+    # Explicitly set link states: link1 down, link2 down, link3 down, link4 up
+    set_link_states(tgen, link1_up=False, link2_up=False, link3_up=False, link4_up=True)
+    # Bounce r1-eth0 and r3-eth0 to trigger route recalculation
+    shutdown_bringup_interface_in_kernel(tgen, 'r1', "r1-eth0", False)
+    shutdown_bringup_interface_in_kernel(tgen, 'r3', "r3-eth0", False)
+    shutdown_bringup_interface_in_kernel(tgen, 'r3', "r3-eth0", True)
+    shutdown_bringup_interface_in_kernel(tgen, 'r1', "r1-eth0", True)
+    r1 = tgen.gears["r1"]
+
+    json_file = "{}/r1/show_ip_route-4.json".format(CWD)
+    expected = json.loads(open(json_file).read())
+    test_func = partial(
+        topotest.router_json_cmp, r1, "show ip route vrf green 10.0.94.2 json", expected
+    )
+    _, result = topotest.run_and_expect(test_func, None, count=60, wait=1)
+
+    assertmsg = "r1 JSON output mismatches"
+    assert result is None, assertmsg
+
+
+def test_link_1_2_3_4_down():
+    "Test path R1 -> R2 -> Rc -> R3  -> R4"
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip("skipped because of router(s) failure")
+
+    # Explicitly set link states: all links down
+    set_link_states(
+        tgen, link1_up=False, link2_up=False, link3_up=False, link4_up=False
+    )
+    r1 = tgen.gears["r1"]
+
+    json_file = "{}/r1/show_ip_route-4.json".format(CWD)
+    expected = json.loads(open(json_file).read())
+    test_func = partial(
+        topotest.router_json_cmp, r1, "show ip route vrf green 10.0.94.2 json", expected
+    )
+    _, result = topotest.run_and_expect(test_func, None, count=60, wait=1)
+
+    assertmsg = "r1 JSON output mismatches"
+    assert result is None, assertmsg
+
+
+def test_link_1_2_4_down_3_up():
+    "Test path R1 -> R2 -> Rc -> R3  -> R4"
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip("skipped because of router(s) failure")
+
+    # Explicitly set link states: link1 down, link2 down, link3 up, link4 down
+    set_link_states(tgen, link1_up=False, link2_up=False, link3_up=True, link4_up=False)
+    r1 = tgen.gears["r1"]
+
+    json_file = "{}/r1/show_ip_route-4.json".format(CWD)
+    expected = json.loads(open(json_file).read())
+    test_func = partial(
+        topotest.router_json_cmp, r1, "show ip route vrf green 10.0.94.2 json", expected
+    )
+    _, result = topotest.run_and_expect(test_func, None, count=60, wait=1)
+
+    assertmsg = "r1 JSON output mismatches"
+    assert result is None, assertmsg
+
+
+def test_link_1_4_down_2_up():
+    "Test path R1 -> R2 -> Ra -> Rb -> R3  -> R4"
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip("skipped because of router(s) failure")
+
+    def _r2_blue_external_gone():
+        # Other routers' externals stay in the LSDB until MaxAge. Only r2's
+        # own advertisement (router-id 10.0.255.2) is flooded when r2-eth1
+        # comes up. A MaxAge copy is already being flushed.
+        #
+        # 'database external' prints each LSA in detail. Age, link-state ID,
+        # and advertising router are separate labeled lines.
+        out = tgen.gears["r2"].vtysh_cmd("show ip ospf vrf blue database external")
+        age = None
+        link_id = None
+        for raw in out.splitlines():
+            line = raw.strip()
+            if line.startswith("LS age:"):
+                age_field = line.split(":", 1)[1].strip().split("(", 1)[0]
+                age = int(age_field) if age_field.isdigit() else None
+                link_id = None
+            elif line.startswith("Link State ID:"):
+                link_field = line.split(":", 1)[1].strip()
+                link_id = link_field.split()[0] if link_field else None
+            elif line.startswith("Advertising Router:"):
+                adv_field = line.split(":", 1)[1].strip()
+                adv = adv_field.split()[0] if adv_field else None
+                if link_id != "10.0.94.0" or adv != "10.0.255.2":
+                    continue
+                if age == 3600:
+                    continue
+                return "r2 still originating 10.0.94.0 into blue: age %s" % age
+        return None
+
+    # Withdraw r2's green path before r2-eth1 joins blue. Otherwise r2 floods
+    # the expensive green metric into blue OSPF in the same exchange that
+    # carries r3's cheaper external, and BGP keeps the worse one.
+    tgen.net["r2"].cmd("ip link set dev r2-eth2 down")
+    try:
+        _, result = topotest.run_and_expect(
+            _r2_blue_external_gone, None, count=60, wait=1
+        )
+        assert result is None, result
+
+        # Explicitly set link states: link1 down, link2 up, link3 up, link4 down
+        set_link_states(
+            tgen, link1_up=False, link2_up=True, link3_up=True, link4_up=False
+        )
+        r1 = tgen.gears["r1"]
+
+        json_file = "{}/r1/show_ip_route-5.json".format(CWD)
+        expected = json.loads(open(json_file).read())
+        test_func = partial(
+            topotest.router_json_cmp,
+            r1,
+            "show ip route vrf green 10.0.94.2 json",
+            expected,
+        )
+        _, result = topotest.run_and_expect(test_func, None, count=120, wait=2)
+
+        assertmsg = "r1 JSON output mismatches"
+        assert result is None, assertmsg
+    finally:
+        tgen.net["r2"].cmd("ip link set dev r2-eth2 up")
+
+    # Green import returns with the worse metric. The redistributed blue OSPF
+    # path stays best, so 10.0.94.0/24 remains metric 238.
+    _, result = topotest.run_and_expect(test_func, None, count=60, wait=1)
+    assert result is None, assertmsg
+
+
+def test_link_4_down_1_up():
+    "Test path R1 -> Ra -> Rb -> R3  -> R4"
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip("skipped because of router(s) failure")
+
+    # Explicitly set link states: link1 up, link2 up, link3 up, link4 down
+    set_link_states(tgen, link1_up=True, link2_up=True, link3_up=True, link4_up=False)
+    r1 = tgen.gears["r1"]
+
+    json_file = "{}/r1/show_ip_route-6.json".format(CWD)
+    expected = json.loads(open(json_file).read())
+    test_func = partial(
+        topotest.router_json_cmp, r1, "show ip route vrf green 10.0.94.2 json", expected
+    )
+    _, result = topotest.run_and_expect(test_func, None, count=120, wait=2)
+
+    assertmsg = "r1 JSON output mismatches"
+    assert result is None, assertmsg
+
+
+def test_link_1_2_3_4_up():
+    "Test path R1 -> Ra -> Rb -> R4"
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip("skipped because of router(s) failure")
+
+    # Explicitly set link states: all links up
+    set_link_states(tgen, link1_up=True, link2_up=True, link3_up=True, link4_up=True)
+    r1 = tgen.gears["r1"]
+
+    json_file = "{}/r1/show_ip_route-1.json".format(CWD)
+    expected = json.loads(open(json_file).read())
+    test_func = partial(
+        topotest.router_json_cmp, r1, "show ip route vrf green 10.0.94.2 json", expected
+    )
+    _, result = topotest.run_and_expect(test_func, None, count=120, wait=2)
+
+    assertmsg = "r1 JSON output mismatches"
+    assert result is None, assertmsg
+
+
+def test_memory_leak():
+    "Run the memory leak test and report results."
+    tgen = get_topogen()
+    if not tgen.is_memleak_enabled():
+        pytest.skip("Memory leak test/report is disabled")
+
+    tgen.report_memory_leaks()
+
+
+if __name__ == "__main__":
+    args = ["-s"] + sys.argv[1:]
+    sys.exit(pytest.main(args))

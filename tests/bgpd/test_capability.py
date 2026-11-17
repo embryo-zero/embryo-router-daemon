@@ -1,0 +1,103 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+import frrtest
+
+
+class TestCapability(frrtest.TestMultiOut):
+    program = "./test_capability"
+
+
+TestCapability.okfail("MP4: MP IP/Uni")
+TestCapability.okfail("MPv6: MP IPv6/Uni")
+TestCapability.okfail("MP2: MP IP/Multicast")
+TestCapability.okfail("MP3: MP IP6/MPLS-labeled VPN")
+TestCapability.okfail("MP5: MP IP6/MPLS-VPN")
+TestCapability.okfail("MP6: MP IP4/MPLS-labeled VPN")
+TestCapability.okfail("MP8: MP unknown AFI/SAFI")
+TestCapability.okfail("MP-short: MP IP4/Unicast, length too short (< minimum)")
+TestCapability.okfail("MP-overflow: MP IP4/Unicast, length too long")
+TestCapability.okfail("caphdr: capability header, and no more")
+TestCapability.okfail("nodata: header, no data but length says there is")
+TestCapability.okfail("padded: valid, with padding")
+TestCapability.okfail("minsize: violates minsize requirement")
+TestCapability.okfail("ORF: ORF, simple, single entry, single tuple")
+TestCapability.okfail("ORF-many: ORF, multi entry/tuple")
+TestCapability.okfail("ORFlo: ORF, multi entry/tuple, hdr length too short")
+TestCapability.okfail("ORFlu: ORF, multi entry/tuple, length too long")
+TestCapability.okfail("ORFnu: ORF, multi entry/tuple, entry number too long")
+TestCapability.okfail("ORFno: ORF, multi entry/tuple, entry number too short")
+TestCapability.okfail("ORFpad: ORF, multi entry/tuple, padded to align")
+TestCapability.okfail("AS4: AS4 capability")
+TestCapability.okfail("GR: GR capability")
+TestCapability.okfail("GR-short: GR capability, but header length too short")
+TestCapability.okfail("GR-long: GR capability, but header length too long")
+TestCapability.okfail("GR-trunc: GR capability, but truncated")
+TestCapability.okfail("GR-empty: GR capability, but empty.")
+TestCapability.okfail("MP-empty: MP capability, but empty.")
+TestCapability.okfail("ORF-empty: ORF capability, but empty.")
+TestCapability.okfail("AS4-empty: AS4 capability, but empty.")
+TestCapability.okfail("dyn-empty: Dynamic capability, but empty.")
+TestCapability.okfail("dyn-old: Dynamic capability (deprecated version)")
+TestCapability.okfail("Role: Role capability")
+TestCapability.okfail("Role-long: Role capability, but too long")
+TestCapability.okfail("Role-empty: Role capability, but empty.")
+TestCapability.okfail("Cap-singlets: One capability per Optional-Param")
+TestCapability.okfail("Cap-series: Series of capability, one Optional-Param")
+TestCapability.okfail("AS4more: AS4 capability after other caps (singlets)")
+TestCapability.okfail("AS4series: AS4 capability, in series of capabilities")
+TestCapability.okfail("AS4real: AS4 capability, in series of capabilities")
+TestCapability.okfail("AS4real2: AS4 capability, in series of capabilities")
+TestCapability.okfail(
+    "PathsLimit-noAddPath: Paths-Limit capability without Add-Path capability"
+)
+TestCapability.okfail(
+    "PathsLimit-first: Paths-Limit capability before Add-Path capability"
+)
+TestCapability.okfail(
+    "PathsLimit-after: Paths-Limit capability after Add-Path capability"
+)
+TestCapability.okfail(
+    "PathsLimit-AFI: Paths-Limit capability with AFI/SAFI not in Add-Path capability"
+)
+TestCapability.okfail("DynCap: Dynamic Capability Message, IP/Multicast")
+TestCapability.okfail("DynCapLong: Dynamic Capability Message, IP/Multicast, truncated")
+TestCapability.okfail("DynCapPadded: Dynamic Capability Message, IP/Multicast, padded")
+TestCapability.okfail(
+    "DynCapMPCpadded: Dynamic Capability Message, IP/Multicast, cap data padded"
+)
+TestCapability.okfail(
+    "DynCapMPCoverflow: Dynamic Capability Message, IP/Multicast, cap data != length"
+)
+TestCapability.okfail("PathsLimit-dup: Paths-Limit capability, same AFI/SAFI twice")
+TestCapability.okfail(
+    "PathsLimit-dup-caps: Two Paths-Limit capabilities, same AFI/SAFI in both"
+)
+TestCapability.okfail(
+    "DynCapPathsLimit-dup: Dynamic Capability Message, Paths-Limit, same AFI/SAFI twice"
+)
+TestCapability.okfail(
+    "DynCapPathsLimit-update: Dynamic Capability Message, Paths-Limit, update AFI/SAFI from previous message"
+)
+TestCapability.okfail(
+    "PathsLimit-zero: Paths-Limit capability, zero limit, then same AFI/SAFI again"
+)
+TestCapability.okfail(
+    "DynCapPathsLimit-zero: Dynamic Capability Message, Paths-Limit, zero limit, then same AFI/SAFI again"
+)
+TestCapability.okfail(
+    "DynCapPathsLimit-dup-caps: Dynamic Capability Message, two Paths-Limit capabilities, same AFI/SAFI in both"
+)
+TestCapability.okfail(
+    "DynCapPathsLimit-unset-set: Dynamic Capability Message, Paths-Limit SET, UNSET and SET again"
+)
+TestCapability.okfail(
+    "DynCapPathsLimit-zero-keep: Dynamic Capability Message, Paths-Limit SET with zero limit keeps the old limit"
+)
+TestCapability.okfail(
+    "DynCapPathsLimit-remove-unset: Dynamic Capability Message, Paths-Limit removed, UNSET"
+)
+TestCapability.okfail(
+    "DynCapPathsLimit-remove-set: Dynamic Capability Message, Paths-Limit removed, SET with zero limit"
+)
+TestCapability.okfail(
+    "DynCap-SAFI: Dynamic Capability Message, GR, LLGR and Paths-Limit with IANA SAFIs"
+)

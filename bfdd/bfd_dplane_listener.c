@@ -1,0 +1,767 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+/*
+ * BFD data plane listener.
+ *
+ * A minimal stand-in for a real BFD data plane, used by the topology
+ * tests. It accepts the bfdd data plane connection, tracks the sessions
+ * bfdd registers, reports them up, answers session counter requests,
+ * and dumps what it has seen on SIGUSR1 so a test can inspect it.
+ *
+ * With `-c <bits>` it declares those capabilities when bfdd connects, and
+ * SIGUSR2 withdraws them all.
+ *
+ * It runs no BFD state machine and sends no BFD packets: a session is
+ * declared up as soon as it is registered. That is enough for the
+ * daemon to treat it as established, which is what lets a test reach
+ * the code paths that only run when a data plane is attached.
+ *
+ * `-e` sets the Required Min Echo RX it reports for the peer, and the
+ * dump shows the echo interval the daemon asked for in return.
+ *
+ * With `-n <count>` it sends that many ECHO_REQUESTs before each counters
+ * reply, as a data plane does when it has something else to tell the
+ * daemon at that moment. `-g <ms>` pauses between them and the reply;
+ * without it they go out in the same write.
+ *
+ * Copyright (C) 2026 Abdul Wasey <awasey8905@gmail.com>
+ */
+
+#include "config.h"
+
+#include <arpa/inet.h>
+#include <errno.h>
+#include <libgen.h>
+#include <limits.h>
+#include <netinet/in.h>
+#include <signal.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <time.h>
+#include <unistd.h>
+
+#include "lib/libfrr.h"
+#include "lib/frratomic.h"
+
+#include "bfddp_packet.h"
+
+XREF_SETUP();
+
+#define BFD_DPLANE_DEFAULT_PORT 50700
+#define BFD_DPLANE_MAX_SESSIONS 256
+#define BFD_DPLANE_MSG_TYPES	10
+/* Keys recorded from the most recent DP_SESSION_AUTH, for a test to read. */
+#define BFD_DPLANE_MAX_AUTH_KEYS 8
+#define BFD_DPLANE_BUFSIZ	65536
+
+static const char *const msgtype_str[BFD_DPLANE_MSG_TYPES] = {
+	"ECHO_REQUEST",		"ECHO_REPLY",
+	"DP_ADD_SESSION",	"DP_DELETE_SESSION",
+	"BFD_STATE_CHANGE",	"DP_REQUEST_SESSION_COUNTERS",
+	"BFD_SESSION_COUNTERS", "DP_SESSION_AUTH",
+	"BFD_DP_CAPABILITIES",	"UNKNOWN",
+};
+
+/* One key as it arrived, so the lifetimes can be checked as sent. */
+struct listener_auth_key {
+	uint8_t type;
+	uint8_t key_id;
+	uint8_t key_len;
+	int64_t send_start;
+	int64_t send_end;
+	int64_t accept_start;
+	int64_t accept_end;
+};
+
+struct listener_glob {
+	FILE *output_file;
+	const char *dump_file;
+	int server_sock;
+	int client_sock;
+	bool connected;
+
+	/* Declared on every connection when `caps_set`, `-c`. */
+	uint64_t caps;
+	bool caps_set;
+
+	/* `-n`, `-g`: ECHO_REQUESTs ahead of every counters reply, and the
+	 * pause in milliseconds before the reply.
+	 */
+	unsigned int noise;
+	unsigned int noise_gap;
+
+	unsigned long connections;
+	unsigned long msg_count[BFD_DPLANE_MSG_TYPES];
+	unsigned long counter_replies;
+	unsigned long state_changes;
+	unsigned long bytes_in;
+
+	/* Sessions registered that said they authenticate. */
+	unsigned long auth_sessions;
+
+	/* Authentication keys, from the most recent message carrying any. */
+	unsigned long auth_keys;
+	uint32_t auth_lid;
+	size_t auth_key_count;
+	struct listener_auth_key auth_key[BFD_DPLANE_MAX_AUTH_KEYS];
+
+	/* Handed out as the remote discriminator, one per session. */
+	uint32_t next_rid;
+
+	/* Reported as the peer's Required Min Echo RX (-e), and the echo
+	 * interval the daemon last asked for in return.
+	 */
+	uint32_t echo_rx;
+	uint32_t echo_tx_requested;
+	bool echo_flag;
+
+	uint32_t sessions[BFD_DPLANE_MAX_SESSIONS];
+	size_t session_count;
+
+	/* The interface each session last arrived with, by `sessions` slot. */
+	uint32_t session_ifindex[BFD_DPLANE_MAX_SESSIONS];
+	char session_ifname[BFD_DPLANE_MAX_SESSIONS][sizeof(((struct bfddp_session *)0)->ifname) + 1];
+};
+
+/* Set by SIGUSR2; the connection loop withdraws the capabilities. */
+static atomic_bool caps_withdraw;
+/* The signal mask to wait with: SIGUSR2 is blocked everywhere else. */
+static sigset_t wait_mask;
+
+static struct listener_glob glob_space;
+static struct listener_glob *glob = &glob_space;
+
+static const char *get_timestamp(void)
+{
+	static char buf[64];
+	time_t now = time(NULL);
+	struct tm tm;
+
+	localtime_r(&now, &tm);
+	strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm);
+
+	return buf;
+}
+
+static bool session_add(uint32_t lid)
+{
+	size_t i;
+
+	for (i = 0; i < glob->session_count; i++)
+		if (glob->sessions[i] == lid)
+			return false;
+
+	if (glob->session_count >= BFD_DPLANE_MAX_SESSIONS)
+		return false;
+
+	glob->sessions[glob->session_count++] = lid;
+
+	return true;
+}
+
+static void session_del(uint32_t lid)
+{
+	size_t i, last;
+
+	for (i = 0; i < glob->session_count; i++) {
+		if (glob->sessions[i] != lid)
+			continue;
+
+		last = glob->session_count - 1;
+		glob->sessions[i] = glob->sessions[last];
+		glob->session_ifindex[i] = glob->session_ifindex[last];
+		memcpy(glob->session_ifname[i], glob->session_ifname[last],
+		       sizeof(glob->session_ifname[i]));
+		glob->session_count--;
+		return;
+	}
+}
+
+/* Keep the interface a registration, first or repeated, came with. */
+static void session_set_iface(const struct bfddp_session *session)
+{
+	uint32_t lid = ntohl(session->lid);
+	size_t i;
+
+	for (i = 0; i < glob->session_count; i++) {
+		if (glob->sessions[i] != lid)
+			continue;
+
+		glob->session_ifindex[i] = ntohl(session->ifindex);
+		/* Need not be NUL-terminated; the slot has room for one. */
+		memcpy(glob->session_ifname[i], session->ifname, sizeof(session->ifname));
+		glob->session_ifname[i][sizeof(session->ifname)] = '\0';
+		return;
+	}
+}
+
+/* Signal handler for SIGUSR1: write everything seen so far. */
+static void sigusr1_handler(int signum)
+{
+	FILE *out = glob->output_file;
+	FILE *dump_fp = NULL;
+	size_t i;
+
+	(void)signum;
+
+	if (glob->dump_file) {
+		dump_fp = fopen(glob->dump_file, "w");
+		if (dump_fp) {
+			out = dump_fp;
+			setbuf(dump_fp, NULL);
+		}
+	}
+
+	fprintf(out, "\n=== BFD Data Plane Listener Dump ===\n");
+	fprintf(out, "Timestamp: %s\n", get_timestamp());
+	fprintf(out, "Connections accepted: %lu\n", glob->connections);
+	fprintf(out, "Connection state: %s\n", glob->connected ? "connected" : "disconnected");
+	fprintf(out, "Bytes received: %lu\n", glob->bytes_in);
+	if (glob->caps_set)
+		fprintf(out, "Capabilities declared: 0x%016llx\n", (unsigned long long)glob->caps);
+	else
+		fprintf(out, "Capabilities declared: none\n");
+	fprintf(out, "Counter replies sent: %lu\n", glob->counter_replies);
+	fprintf(out, "State changes sent: %lu\n", glob->state_changes);
+
+	fprintf(out, "Messages received:\n");
+	for (i = 0; i < BFD_DPLANE_MSG_TYPES; i++)
+		fprintf(out, "  %s: %lu\n", msgtype_str[i], glob->msg_count[i]);
+
+	fprintf(out, "Auth sessions: %lu\n", glob->auth_sessions);
+	fprintf(out, "Auth keys received: %lu\n", glob->auth_keys);
+	fprintf(out, "Auth last lid: %u\n", glob->auth_lid);
+	fprintf(out, "Auth last key count: %zu\n", glob->auth_key_count);
+	for (i = 0; i < glob->auth_key_count; i++)
+		fprintf(out, "  auth key: id %u type %u len %u send %lld %lld accept %lld %lld\n",
+			glob->auth_key[i].key_id, glob->auth_key[i].type,
+			glob->auth_key[i].key_len, (long long)glob->auth_key[i].send_start,
+			(long long)glob->auth_key[i].send_end,
+			(long long)glob->auth_key[i].accept_start,
+			(long long)glob->auth_key[i].accept_end);
+	fprintf(out, "Echo requested: %s\n", glob->echo_flag ? "yes" : "no");
+	fprintf(out, "Echo interval requested: %u\n", glob->echo_tx_requested);
+
+	fprintf(out, "Sessions registered: %zu\n", glob->session_count);
+	for (i = 0; i < glob->session_count; i++)
+		fprintf(out, "  lid: %u\n", glob->sessions[i]);
+	for (i = 0; i < glob->session_count; i++)
+		fprintf(out, "  interface: lid %u ifindex %u ifname %s\n", glob->sessions[i],
+			glob->session_ifindex[i],
+			glob->session_ifname[i][0] ? glob->session_ifname[i] : "-");
+
+	fprintf(out, "====================================\n\n");
+	fflush(out);
+
+	if (dump_fp)
+		fclose(dump_fp);
+}
+
+FRR_NORETURN
+static void sigterm_handler(int signum)
+{
+	(void)signum;
+
+	if (glob->client_sock >= 0)
+		close(glob->client_sock);
+	if (glob->server_sock >= 0)
+		close(glob->server_sock);
+
+	exit(0);
+}
+
+static bool create_listen_sock(int port, int *sock_p)
+{
+	int sock;
+	int one = 1;
+	struct sockaddr_in addr = {};
+
+	sock = socket(AF_INET, SOCK_STREAM, 0);
+	if (sock < 0) {
+		fprintf(stderr, "Failed to create socket: %s\n", strerror(errno));
+		return false;
+	}
+
+	if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one))) {
+		fprintf(stderr, "Failed to set SO_REUSEADDR: %s\n", strerror(errno));
+		close(sock);
+		return false;
+	}
+
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(port);
+	addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+	if (bind(sock, (struct sockaddr *)&addr, sizeof(addr))) {
+		fprintf(stderr, "Failed to bind to port %d: %s\n", port, strerror(errno));
+		close(sock);
+		return false;
+	}
+
+	if (listen(sock, 5)) {
+		fprintf(stderr, "Failed to listen: %s\n", strerror(errno));
+		close(sock);
+		return false;
+	}
+
+	*sock_p = sock;
+
+	return true;
+}
+
+/* Append an ECHO_REQUEST to `buf` at `off`; returns its length. */
+static size_t put_echo_request(uint8_t *buf, size_t off)
+{
+	struct bfddp_message msg = {};
+	uint16_t len = sizeof(struct bfddp_message_header) + sizeof(struct bfddp_echo);
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+
+	msg.header.version = BFD_DP_VERSION;
+	msg.header.type = htons(ECHO_REQUEST);
+	msg.header.length = htons(len);
+	msg.data.echo.dp_time = htobe64((uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000);
+	memcpy(buf + off, &msg, len);
+
+	return len;
+}
+
+/*
+ * Answer a counter request. Control packets in is the number of this
+ * reply and control packets out the session's own discriminator, so a
+ * test can tell a stale reply, or one given to another session, from
+ * the right one.
+ */
+static bool send_counters_reply(int sock, uint16_t id, uint32_t lid)
+{
+	struct bfddp_message msg = {};
+	uint16_t len = sizeof(struct bfddp_message_header) + sizeof(struct bfddp_session_counters);
+	size_t elen = sizeof(struct bfddp_message_header) + sizeof(struct bfddp_echo);
+	uint8_t buf[BFD_DPLANE_BUFSIZ];
+	size_t off = 0;
+	unsigned int i;
+
+	for (i = 0; i < glob->noise && off + elen + len <= sizeof(buf); i++)
+		off += put_echo_request(buf, off);
+	if (off && glob->noise_gap) {
+		if (write(sock, buf, off) != (ssize_t)off)
+			return false;
+		usleep(glob->noise_gap * 1000);
+		off = 0;
+	}
+
+	msg.header.version = BFD_DP_VERSION;
+	msg.header.type = htons(BFD_SESSION_COUNTERS);
+	msg.header.id = id;
+	msg.header.length = htons(len);
+	msg.data.session_counters.lid = lid;
+	msg.data.session_counters.control_input_packets = htobe64(glob->counter_replies + 1);
+	msg.data.session_counters.control_output_packets = htobe64(ntohl(lid));
+	memcpy(buf + off, &msg, len);
+	off += len;
+
+	if (write(sock, buf, off) != (ssize_t)off) {
+		fprintf(glob->output_file, "Failed to send counters: %s\n", strerror(errno));
+		return false;
+	}
+
+	glob->counter_replies++;
+
+	return true;
+}
+
+/*
+ * Declare capabilities as the first message on the connection, the way a
+ * data plane should, before the daemon has offered it anything.
+ */
+static bool send_capabilities(int sock)
+{
+	struct bfddp_message msg = {};
+	uint16_t len = sizeof(struct bfddp_message_header) + sizeof(struct bfddp_capabilities);
+
+	msg.header.version = BFD_DP_VERSION;
+	msg.header.type = htons(BFD_DP_CAPABILITIES);
+	msg.header.length = htons(len);
+	msg.data.capabilities.capabilities = htobe64(glob->caps);
+
+	if (write(sock, &msg, len) != len) {
+		fprintf(glob->output_file, "Failed to send capabilities: %s\n", strerror(errno));
+		return false;
+	}
+
+	return true;
+}
+
+/* Signal handler for SIGUSR2: withdraw every capability declared. */
+static void sigusr2_handler(int signum)
+{
+	(void)signum;
+
+	atomic_store_explicit(&caps_withdraw, true, memory_order_relaxed);
+}
+
+static bool send_echo_reply(int sock, const struct bfddp_message *req)
+{
+	struct bfddp_message msg = {};
+	uint16_t len = sizeof(struct bfddp_message_header) + sizeof(struct bfddp_echo);
+
+	msg.header.version = BFD_DP_VERSION;
+	msg.header.type = htons(ECHO_REPLY);
+	msg.header.id = req->header.id;
+	msg.header.length = htons(len);
+	msg.data.echo = req->data.echo;
+
+	return write(sock, &msg, len) == len;
+}
+
+/*
+ * Report a session as up.
+ *
+ * A real data plane runs the BFD state machine and tells the daemon when
+ * a session changes state. This one has no peer to talk to, so it simply
+ * declares the session up as soon as it is registered and echoes the
+ * timers back. That is enough for the daemon to treat the session as
+ * established, which is what the tests need.
+ */
+static bool send_state_change(int sock, const struct bfddp_session *session)
+{
+	struct bfddp_message msg = {};
+	uint16_t len = sizeof(struct bfddp_message_header) + sizeof(struct bfddp_state_change);
+
+	msg.header.version = BFD_DP_VERSION;
+	msg.header.type = htons(BFD_STATE_CHANGE);
+	msg.header.id = 0; /* asynchronous, not a reply */
+	msg.header.length = htons(len);
+
+	msg.data.state.lid = session->lid;
+	msg.data.state.rid = htonl(glob->next_rid++);
+	msg.data.state.state = STATE_UP;
+	msg.data.state.diagnostics = 0;
+	msg.data.state.detection_multiplier = session->detect_mult;
+	msg.data.state.desired_tx = session->min_tx;
+	msg.data.state.required_rx = session->min_rx;
+	msg.data.state.required_echo_rx = htonl(glob->echo_rx);
+
+	if (write(sock, &msg, len) != len) {
+		fprintf(glob->output_file, "Failed to send state change: %s\n", strerror(errno));
+		return false;
+	}
+
+	glob->state_changes++;
+
+	return true;
+}
+
+/*
+ * Keep what a DP_SESSION_AUTH carried.
+ *
+ * The keys travel with the periods in which they may be used, so a test
+ * can check that the lifetimes configured are the lifetimes that arrived,
+ * not merely that some key turned up.
+ */
+static void record_auth_keys(const struct bfddp_message *msg)
+{
+	const struct bfddp_auth_key *keys;
+	uint16_t count;
+	size_t i;
+
+	count = ntohs(msg->data.session_auth.key_count);
+	glob->auth_lid = ntohl(msg->data.session_auth.lid);
+	glob->auth_keys += count;
+
+	keys = msg->data.session_auth.keys;
+
+	glob->auth_key_count = count < BFD_DPLANE_MAX_AUTH_KEYS ? count : BFD_DPLANE_MAX_AUTH_KEYS;
+
+	for (i = 0; i < glob->auth_key_count; i++) {
+		glob->auth_key[i].type = keys[i].type;
+		glob->auth_key[i].key_id = keys[i].key_id;
+		glob->auth_key[i].key_len = keys[i].key_len;
+		glob->auth_key[i].send_start = (int64_t)be64toh((uint64_t)keys[i].send.start);
+		glob->auth_key[i].send_end = (int64_t)be64toh((uint64_t)keys[i].send.end);
+		glob->auth_key[i].accept_start = (int64_t)be64toh((uint64_t)keys[i].accept.start);
+		glob->auth_key[i].accept_end = (int64_t)be64toh((uint64_t)keys[i].accept.end);
+	}
+}
+
+static void handle_message(int sock, const struct bfddp_message *msg)
+{
+	uint16_t type = ntohs(msg->header.type);
+
+	if (type < BFD_DPLANE_MSG_TYPES - 1)
+		glob->msg_count[type]++;
+	else
+		glob->msg_count[BFD_DPLANE_MSG_TYPES - 1]++;
+
+	switch (type) {
+	case ECHO_REQUEST:
+		send_echo_reply(sock, msg);
+		break;
+	case DP_ADD_SESSION:
+		if (ntohl(msg->data.session.flags) & SESSION_AUTH)
+			glob->auth_sessions++;
+		glob->echo_flag = !!(ntohl(msg->data.session.flags) & SESSION_ECHO);
+		glob->echo_tx_requested = ntohl(msg->data.session.min_echo_tx);
+		if (session_add(ntohl(msg->data.session.lid)))
+			send_state_change(sock, &msg->data.session);
+		session_set_iface(&msg->data.session);
+		break;
+	case DP_DELETE_SESSION:
+		session_del(ntohl(msg->data.session.lid));
+		break;
+	case DP_REQUEST_SESSION_COUNTERS:
+		send_counters_reply(sock, msg->header.id, msg->data.counters_req.lid);
+		break;
+	case DP_SESSION_AUTH:
+		record_auth_keys(msg);
+		break;
+	default:
+		break;
+	}
+}
+
+static void handle_connection(int sock)
+{
+	uint8_t buf[BFD_DPLANE_BUFSIZ];
+	size_t buflen = 0;
+
+	while (true) {
+		ssize_t rv;
+		size_t offset = 0;
+
+		fd_set rfds;
+
+		if (atomic_exchange_explicit(&caps_withdraw, false, memory_order_relaxed)) {
+			glob->caps = 0;
+			glob->caps_set = true;
+			send_capabilities(sock);
+		}
+
+		/* SIGUSR2 can only arrive in here, so it is never missed. */
+		FD_ZERO(&rfds);
+		FD_SET(sock, &rfds);
+		if (pselect(sock + 1, &rfds, NULL, NULL, NULL, &wait_mask) < 0) {
+			if (errno == EINTR)
+				continue;
+			fprintf(glob->output_file, "Wait failed: %s\n", strerror(errno));
+			break;
+		}
+
+		rv = read(sock, buf + buflen, sizeof(buf) - buflen);
+		if (rv == 0) {
+			fprintf(glob->output_file, "Connection closed\n");
+			break;
+		}
+		if (rv < 0) {
+			if (errno == EINTR)
+				continue;
+			fprintf(glob->output_file, "Read failed: %s\n", strerror(errno));
+			break;
+		}
+
+		buflen += (size_t)rv;
+		glob->bytes_in += (size_t)rv;
+
+		while (buflen - offset >= sizeof(struct bfddp_message_header)) {
+			struct bfddp_message msg;
+			struct bfddp_message_header hdr;
+			uint16_t msglen;
+
+			/*
+			 * Copy rather than cast: the message starts at an
+			 * arbitrary offset in the byte buffer, and the
+			 * structures hold 32 and 64 bit fields that must
+			 * not be read unaligned.
+			 */
+			memcpy(&hdr, buf + offset, sizeof(hdr));
+			msglen = ntohs(hdr.length);
+
+			if (hdr.version != BFD_DP_VERSION || msglen < sizeof(hdr) ||
+			    msglen > sizeof(msg)) {
+				fprintf(glob->output_file, "Framing error: version %d length %d\n",
+					hdr.version, msglen);
+				return;
+			}
+
+			if (buflen - offset < msglen)
+				break;
+
+			memcpy(&msg, buf + offset, msglen);
+			handle_message(sock, &msg);
+			offset += msglen;
+		}
+
+		if (offset) {
+			memmove(buf, buf + offset, buflen - offset);
+			buflen -= offset;
+		}
+
+		/*
+		 * A message larger than the buffer cannot be assembled, and
+		 * the protocol has none that big.
+		 */
+		if (buflen == sizeof(buf)) {
+			fprintf(glob->output_file, "Buffer full with an incomplete message\n");
+			return;
+		}
+	}
+}
+
+int main(int argc, char **argv)
+{
+	struct sigaction sa;
+	sigset_t usr2;
+	bool fork_daemon = false;
+	const char *output_file = NULL;
+	int port = BFD_DPLANE_DEFAULT_PORT;
+	int r;
+
+	memset(glob, 0, sizeof(*glob));
+	glob->output_file = stdout;
+	glob->server_sock = -1;
+	glob->client_sock = -1;
+	glob->next_rid = 1;
+
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = sigusr1_handler;
+	sigemptyset(&sa.sa_mask);
+	sa.sa_flags = SA_RESTART;
+	if (sigaction(SIGUSR1, &sa, NULL) < 0) {
+		fprintf(stderr, "Failed to set up SIGUSR1 handler: %s\n", strerror(errno));
+		exit(1);
+	}
+
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = sigusr2_handler;
+	sigemptyset(&sa.sa_mask);
+	if (sigaction(SIGUSR2, &sa, NULL) < 0) {
+		fprintf(stderr, "Failed to set up SIGUSR2 handler: %s\n", strerror(errno));
+		exit(1);
+	}
+
+	/* Blocked except while the connection loop waits for bfdd. */
+	sigemptyset(&usr2);
+	sigaddset(&usr2, SIGUSR2);
+	sigprocmask(SIG_BLOCK, &usr2, &wait_mask);
+
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = sigterm_handler;
+	sigemptyset(&sa.sa_mask);
+	if (sigaction(SIGTERM, &sa, NULL) < 0 || sigaction(SIGINT, &sa, NULL) < 0 ||
+	    sigaction(SIGHUP, &sa, NULL) < 0) {
+		fprintf(stderr, "Failed to set up signal handlers: %s\n", strerror(errno));
+		exit(1);
+	}
+
+	signal(SIGPIPE, SIG_IGN);
+
+	while ((r = getopt(argc, argv, "c:de:g:n:o:p:z:")) != -1) {
+		switch (r) {
+		case 'c':
+			glob->caps = strtoull(optarg, NULL, 0);
+			glob->caps_set = true;
+			break;
+		case 'd':
+			fork_daemon = true;
+			break;
+		case 'e':
+			glob->echo_rx = strtoul(optarg, NULL, 10);
+			break;
+		case 'g':
+			glob->noise_gap = strtoul(optarg, NULL, 10);
+			break;
+		case 'n':
+			glob->noise = strtoul(optarg, NULL, 10);
+			break;
+		case 'o':
+			output_file = optarg;
+			break;
+		case 'p':
+			port = atoi(optarg);
+			break;
+		case 'z':
+			glob->dump_file = optarg;
+			break;
+		}
+	}
+
+	if (output_file) {
+		glob->output_file = fopen(output_file, "w");
+		if (!glob->output_file) {
+			fprintf(stderr, "Failed to open output file %s: %s\n", output_file,
+				strerror(errno));
+			exit(1);
+		}
+	}
+
+	setbuf(glob->output_file, NULL);
+
+	/*
+	 * Bind before forking. The daemon that connects to us is started
+	 * as soon as the parent exits, so the socket has to be accepting
+	 * by then or that first connection attempt is refused.
+	 */
+	if (!create_listen_sock(port, &glob->server_sock))
+		exit(1);
+
+	if (fork_daemon) {
+		if (fork())
+			exit(0);
+
+		if (glob->dump_file) {
+			char *copy = strdup(glob->dump_file);
+			char pid_path[PATH_MAX];
+			FILE *pid_file;
+
+			snprintf(pid_path, sizeof(pid_path), "%s/bfd_dplane_listener.pid",
+				 dirname(copy));
+
+			pid_file = fopen(pid_path, "w");
+			if (pid_file) {
+				fprintf(pid_file, "%d\n", getpid());
+				fclose(pid_file);
+			} else {
+				fprintf(stderr, "Failed to write PID file %s: %s\n", pid_path,
+					strerror(errno));
+			}
+			free(copy);
+		}
+	}
+
+	fprintf(glob->output_file, "Listening on 127.0.0.1:%d\n", port);
+
+	while (true) {
+		struct sockaddr_in from = {};
+		socklen_t fromlen = sizeof(from);
+		int sock;
+
+		sock = accept(glob->server_sock, (struct sockaddr *)&from, &fromlen);
+		if (sock < 0) {
+			if (errno == EINTR)
+				continue;
+			fprintf(stderr, "Failed to accept: %s\n", strerror(errno));
+			exit(1);
+		}
+
+		glob->connections++;
+		glob->connected = true;
+		glob->client_sock = sock;
+		fprintf(glob->output_file, "Connection %lu accepted\n", glob->connections);
+
+		if (glob->caps_set)
+			send_capabilities(sock);
+
+		handle_connection(sock);
+
+		glob->connected = false;
+		glob->client_sock = -1;
+		close(sock);
+	}
+
+	return 0;
+}
